@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "file-index"
+version = "0.1.0"
+description = "Fully local filesystem content indexer with hybrid keyword+vector search and an agent CLI"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "pyyaml>=6",
+    "blake3>=0.4",
+    "charset-normalizer>=3",
+    "pymupdf>=1.24",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6",
+    "watchdog>=4",
+    "sqlite-vec>=0.1",
+    "pillow>=10",
+    "requests>=2.31",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+deep = [
+    "faster-whisper>=1.0",
+    "scenedetect>=0.6",
+]
+dev = ["pytest>=8"]
+
+[project.scripts]
+file-index = "file_index.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["file_index*"]

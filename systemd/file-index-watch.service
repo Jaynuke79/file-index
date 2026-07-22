@@ -1,0 +1,21 @@
+# systemd user unit for the file-index watchdog daemon.
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/file-index-watch.service ~/.config/systemd/user/
+#   # edit ExecStart below if your venv lives elsewhere
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now file-index-watch
+[Unit]
+Description=file-index filesystem watcher (local content indexer)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/gitrepos/file-index/.venv/bin/file-index watch
+Restart=on-failure
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
