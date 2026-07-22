@@ -13,7 +13,12 @@ from ..ollama_client import OllamaClient
 
 log = logging.getLogger("file_index.extractors.image")
 
-VERSION = "image-1.0"
+VERSION = "image-1.1"
+
+# Formats Ollama's vision path handles natively; everything else (HEIC, WEBP,
+# TIFF, …) is silently misread or rejected, so we transcode first.
+VLM_NATIVE_FORMATS = {"JPEG", "PNG"}
+VLM_MAX_DIM = 2048  # oversized screenshots 500 the vision encoder; downscale
 
 VLM_SCHEMA_KEYS = {
     "description": str,
@@ -117,20 +122,53 @@ def validate_vlm_json(raw: str) -> dict | None:
     return out
 
 
+def prepare_for_vlm(path: Path, tmpdir: Path) -> Path:
+    """Return a VLM-safe image path: JPEG/PNG within VLM_MAX_DIM.
+
+    HEIC/WEBP/TIFF etc. are transcoded to JPEG; oversized images are downscaled.
+    Returns the original path unchanged when it is already safe.
+    """
+    from PIL import Image
+
+    try:
+        import pillow_heif
+
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass
+    with Image.open(path) as img:
+        if img.format in VLM_NATIVE_FORMATS and max(img.size) <= VLM_MAX_DIM:
+            return path
+        img.thumbnail((VLM_MAX_DIM, VLM_MAX_DIM))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        out = tmpdir / (path.stem + ".vlm.jpg")
+        img.save(out, "JPEG", quality=90)
+        return out
+
+
 def analyze_image(
     client: OllamaClient, model: str, path: Path
 ) -> tuple[dict | None, str, bool]:
     """Run the VLM. Returns (validated_json_or_None, raw_output, degraded)."""
-    raw = client.generate(model, VLM_PROMPT, images=[path], format_json=True)
-    data = validate_vlm_json(raw)
-    if data is not None:
-        return data, raw, False
-    log.info("VLM JSON invalid for %s, retrying once", path)
-    raw = client.generate(model, VLM_PROMPT, images=[path], format_json=True)
-    data = validate_vlm_json(raw)
-    if data is not None:
-        return data, raw, False
-    return None, raw, True
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="file-index-vlm-") as tmp:
+        try:
+            safe = prepare_for_vlm(path, Path(tmp))
+        except Exception as e:  # noqa: BLE001 — undecodable image: let the VLM try raw
+            log.warning("could not preprocess %s (%s); sending as-is", path, e)
+            safe = path
+        raw = client.generate(model, VLM_PROMPT, images=[safe], format_json=True)
+        data = validate_vlm_json(raw)
+        if data is not None:
+            return data, raw, False
+        log.info("VLM JSON invalid for %s, retrying once", path)
+        raw = client.generate(model, VLM_PROMPT, images=[safe], format_json=True)
+        data = validate_vlm_json(raw)
+        if data is not None:
+            return data, raw, False
+        return None, raw, True
 
 
 def vlm_body_text(data: dict) -> str:
