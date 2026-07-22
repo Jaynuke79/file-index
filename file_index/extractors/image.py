@@ -13,12 +13,12 @@ from ..ollama_client import OllamaClient
 
 log = logging.getLogger("file_index.extractors.image")
 
-VERSION = "image-1.1"
+VERSION = "image-1.2"
 
 # Formats Ollama's vision path handles natively; everything else (HEIC, WEBP,
 # TIFF, …) is silently misread or rejected, so we transcode first.
 VLM_NATIVE_FORMATS = {"JPEG", "PNG"}
-VLM_MAX_DIM = 2048  # oversized screenshots 500 the vision encoder; downscale
+VLM_MAX_DIM = 1344  # larger images OOM the 32B VLM's vision encoder on 32 GB VRAM
 
 VLM_SCHEMA_KEYS = {
     "description": str,
