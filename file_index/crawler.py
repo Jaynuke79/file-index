@@ -75,6 +75,47 @@ def hash_file(path: Path, algo: str = "blake3", chunk_size: int = 1 << 20) -> st
     return h.hexdigest()
 
 
+def exclude_pattern(raw: str) -> str:
+    """Normalize an exclude argument to an fnmatch glob. Existing paths are
+    matched literally ('[' would otherwise start a character class — think
+    torrent dirs like '...[TGx]'); directories cover everything beneath them.
+    """
+    p = Path(raw).expanduser()
+    if p.is_dir():
+        return str(p.resolve()).replace("[", "[[]") + "/*"
+    if p.exists():
+        return str(p.resolve()).replace("[", "[[]")
+    return raw
+
+
+def apply_exclude(config: Config, index: Index, pattern: str) -> tuple[str, int, int]:
+    """Add an exclude pattern and soft-remove matching files from the index.
+
+    Index-only: never touches files on disk. A directory argument excludes
+    everything under it. Returns (normalized_pattern, files_removed,
+    pending_deep_skipped). Reversible: drop the pattern from config.yaml and
+    re-run `scan` — extractions on soft-deleted rows are retained.
+    """
+    pattern = exclude_pattern(pattern)
+    removed = pending = 0
+    for row in index.db.execute(
+        "SELECT f.id, f.path, q.status FROM files f "
+        "LEFT JOIN queue q ON q.file_id=f.id AND q.tier=2 WHERE f.deleted=0"
+    ).fetchall():
+        if fnmatch.fnmatch(row["path"], pattern):
+            index.mark_deleted(row["id"])
+            removed += 1
+            if row["status"] == PENDING_DEEP:
+                pending += 1
+    if pattern not in config.excludes:
+        config.excludes.append(pattern)
+        config.save()
+    index.audit("exclude", None, None,
+                f"pattern={pattern} removed={removed} pending_skipped={pending}")
+    index.commit()
+    return pattern, removed, pending
+
+
 @dataclass
 class CrawlStats:
     scanned: int = 0
