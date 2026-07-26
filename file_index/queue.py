@@ -177,6 +177,8 @@ class Tier2Worker:
     def _process(self, item, path: Path) -> None:
         if not path.exists():
             raise FileNotFoundError(path)
+        if self._reuse_duplicate(item, path):
+            return
         kind = item["kind"] or item["file_kind"]
         if kind == "image":
             self._process_image(item, path)
@@ -188,6 +190,23 @@ class Tier2Worker:
             self._process_video(item, path)
         else:
             log.info("no tier-2 handler for kind=%s (%s)", kind, path)
+
+    def _reuse_duplicate(self, item, path: Path) -> bool:
+        """A byte-identical file (same hash) was already deep-processed under
+        another path: copy its results instead of re-running the models."""
+        row = self.index.db.execute(
+            "SELECT f2.id, f2.path FROM files f "
+            "JOIN files f2 ON f2.hash=f.hash AND f2.id != f.id "
+            "JOIN queue q2 ON q2.file_id=f2.id AND q2.tier=2 AND q2.status='done' "
+            "WHERE f.id=? AND f.hash IS NOT NULL AND f2.deleted=0 LIMIT 1",
+            (item["file_id"],),
+        ).fetchone()
+        if not row:
+            return False
+        n = self.index.clone_tier2_content(row["id"], item["file_id"])
+        if n:
+            log.info("reused deep results of identical %s for %s", row["path"], path)
+        return n > 0
 
     def _process_image(self, item, path: Path) -> None:
         data, raw, degraded = image_ex.analyze_image(

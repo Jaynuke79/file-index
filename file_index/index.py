@@ -20,6 +20,12 @@ PENDING_DEEP = "pending_deep"
 DONE = "done"
 FAILED = "failed"
 
+# Stages produced by tier-2 processing (safe to copy between identical files).
+TIER2_STAGES = {
+    "vlm_image", "pdf_scan_vlm", "whisper", "audio_summary",
+    "video_scenes", "video_transcript", "video_summary",
+}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
@@ -258,6 +264,37 @@ class Index:
                 self.db.execute("DELETE FROM chunk_vec WHERE rowid=?", (c["id"],))
         self.db.execute("DELETE FROM chunks WHERE content_id=?", (content_id,))
         self.db.execute("DELETE FROM content WHERE id=?", (content_id,))
+
+    def clone_tier2_content(self, src_file_id: int, dst_file_id: int) -> int:
+        """Copy tier-2 extraction results to a byte-identical file (same hash),
+        including chunks and embeddings. Returns the number of stages copied.
+        """
+        n = 0
+        for row in self.db.execute(
+            "SELECT * FROM content WHERE file_id=?", (src_file_id,)
+        ).fetchall():
+            if row["stage"] not in TIER2_STAGES:
+                continue
+            meta = json.loads(row["meta"]) if row["meta"] else None
+            cid = self.store_content(
+                dst_file_id, row["stage"], row["extractor_version"], row["body"],
+                meta=meta, degraded=bool(row["degraded"]),
+            )
+            chunks = [
+                {
+                    "text": ch["text"],
+                    "ts_start": ch["ts_start"],
+                    "ts_end": ch["ts_end"],
+                    "embedding": _blob_f32(ch["embedding"]) if ch["embedding"] else None,
+                }
+                for ch in self.db.execute(
+                    "SELECT * FROM chunks WHERE content_id=? ORDER BY chunk_index",
+                    (row["id"],),
+                )
+            ]
+            self.store_chunks(dst_file_id, cid, row["stage"], chunks)
+            n += 1
+        return n
 
     def get_content(self, file_id: int, stage: str | None = None) -> list[sqlite3.Row]:
         if stage:
