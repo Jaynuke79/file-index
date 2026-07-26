@@ -35,6 +35,7 @@ file-index deep              # tier 2: VLM images, scanned PDFs, Whisper, video 
 file-index ask "where are my insurance documents?"
 file-index organize ~/Downloads            # prints a plan, changes nothing
 file-index organize ~/Downloads --apply    # applies moves/renames after confirmation
+file-index browse            # local web gallery: files + captions, search, filters
 file-index exclude PATH      # remove files from the index + future scans (disk untouched)
 file-index status            # queue stats, per-type counts, failures
 file-index watch             # incremental watcher (or install the systemd unit)
@@ -53,7 +54,15 @@ without code changes: model names, Ollama URL, roots, exclude globs, chunk
 sizes, tier-2 priority order (default: images before video, newest first),
 Whisper device/precision.
 
-Data lives in `~/.local/share/file-index/` (`index.db`, logs, audit log).
+Data lives in `~/.local/share/file-index/` (`index.db`, logs, audit log,
+`thumbs/` cache for the browse UI).
+
+`browse` serves a gallery at `http://127.0.0.1:8765/` (localhost only unless
+`--host` says otherwise): thumbnails for images/videos/PDFs, the VLM caption or
+video/audio summary on each card, full-text search over everything indexed,
+kind filters, and a detail view with the original media, OCR text, EXIF,
+transcripts, and scene lists. It opens the DB read-only, so it is safe to keep
+running while `scan`/`deep` work.
 
 ## Safety model
 
