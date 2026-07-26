@@ -1,4 +1,4 @@
-"""file-index CLI: init, scan, deep, search, ask, organize, status, watch."""
+"""file-index CLI: init, scan, deep, search, ask, organize, browse, status, watch."""
 
 from __future__ import annotations
 
@@ -402,6 +402,25 @@ def watch() -> None:
 
     watcher.run(on_event=on_event)
     console.print("stopped")
+
+
+@app.command()
+def browse(
+    host: str = typer.Option("127.0.0.1", help="Bind address (localhost only by default)."),
+    port: int = typer.Option(8765, help="Port for the web UI."),
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open the UI in the default browser."
+    ),
+) -> None:
+    """Serve a local web gallery of indexed files and their captions."""
+    cfg, _index = _load()
+    if not cfg.db_path.exists():
+        console.print("[red]No index found — run `file-index scan` first.[/red]")
+        raise typer.Exit(1)
+    from .web import serve
+
+    console.print(f"browse UI at [bold]http://{host}:{port}/[/bold] (ctrl-c to stop)")
+    serve(cfg, host=host, port=port, open_browser=open_browser)
 
 
 @app.command()
