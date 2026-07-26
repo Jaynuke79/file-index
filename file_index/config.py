@@ -75,6 +75,9 @@ class Config:
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     deep: DeepConfig = field(default_factory=DeepConfig)
     data_dir: Path = field(default_factory=lambda: DEFAULT_DATA_DIR)
+    # Where save() writes. load_config() sets it to the file it read, so a
+    # Config constructed in tests can never clobber the user's real config.
+    config_path: Path = field(default_factory=lambda: DEFAULT_CONFIG_PATH)
 
     @property
     def db_path(self) -> Path:
@@ -133,7 +136,7 @@ class Config:
         }
 
     def save(self, path: Path | None = None) -> Path:
-        path = path or DEFAULT_CONFIG_PATH
+        path = path or self.config_path
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             yaml.safe_dump(self.to_dict(), f, sort_keys=False)
@@ -154,6 +157,7 @@ def load_config(path: Path | None = None) -> Config:
         raw = yaml.safe_load(f) or {}
 
     cfg = Config()
+    cfg.config_path = path
     cfg.roots = [Path(r).expanduser() for r in raw.get("roots", [])]
     if not cfg.roots:
         raise ConfigError(f"Config at {path} has no whitelisted roots.")

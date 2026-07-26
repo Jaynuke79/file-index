@@ -35,6 +35,7 @@ file-index deep              # tier 2: VLM images, scanned PDFs, Whisper, video 
 file-index ask "where are my insurance documents?"
 file-index organize ~/Downloads            # prints a plan, changes nothing
 file-index organize ~/Downloads --apply    # applies moves/renames after confirmation
+file-index exclude PATH      # remove files from the index + future scans (disk untouched)
 file-index status            # queue stats, per-type counts, failures
 file-index watch             # incremental watcher (or install the systemd unit)
 ```

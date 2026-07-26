@@ -350,6 +350,37 @@ def _append_audit_file(cfg: Config, index: Index) -> None:
 
 
 @app.command()
+def exclude(
+    pattern: str = typer.Argument(..., help="Directory, file, or glob to exclude"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Exclude files from the index and future scans (index-only — files on
+    disk are never touched). Reversible: remove the pattern from config.yaml
+    and re-run scan."""
+    import fnmatch as _fnmatch
+
+    cfg, index = _load()
+    from .crawler import apply_exclude, exclude_pattern
+
+    norm = exclude_pattern(pattern)
+    n = sum(
+        1 for r in index.db.execute("SELECT path FROM files WHERE deleted=0")
+        if _fnmatch.fnmatch(r["path"], norm)
+    )
+    if n and not yes and not typer.confirm(
+        f"Remove {n} indexed files matching {norm}? (files on disk are untouched)",
+        default=False,
+    ):
+        console.print("aborted — nothing changed")
+        return
+    norm, removed, pending = apply_exclude(cfg, index, pattern)
+    console.print(
+        f"excluded [bold]{norm}[/bold]: [green]{removed} removed from index[/green] "
+        f"({pending} skipped from the deep queue); future scans will skip it"
+    )
+
+
+@app.command()
 def watch() -> None:
     """Watch roots for changes and index them incrementally (daemon)."""
     cfg, index = _load()

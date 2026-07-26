@@ -97,3 +97,46 @@ def test_symlinks_ignored(tmp_env):
     stats = crawl(cfg, index)
     assert stats.new == 1
     assert stats.errors == 0
+
+
+def test_exclude_removes_and_stays_gone(tmp_env):
+    from file_index.crawler import apply_exclude
+
+    cfg, index, root = tmp_env
+    keep = root / "keep.txt"
+    keep.write_text("keep me")
+    sub = root / "big_videos"
+    sub.mkdir()
+    (sub / "huge.txt").write_text("slow to process")
+    Crawler(cfg, index).crawl()
+
+    pattern, removed, _ = apply_exclude(cfg, index, str(sub))
+    assert removed == 1
+    assert pattern in cfg.excludes
+    row = index.get_file_by_path(str((sub / "huge.txt").resolve()))
+    assert row["deleted"] == 1
+    # queue no longer serves it
+    pending = [
+        index.next_pending(tier=1) for _ in range(5)
+    ]
+    assert all(p is None or "big_videos" not in p["path"] for p in pending)
+    # re-crawl honors the new exclude: file stays out
+    Crawler(cfg, index).crawl()
+    row = index.get_file_by_path(str((sub / "huge.txt").resolve()))
+    assert row["deleted"] == 1
+    assert index.get_file_by_path(str(keep.resolve()))["deleted"] == 0
+
+
+def test_exclude_escapes_glob_brackets(tmp_env):
+    from file_index.crawler import apply_exclude
+
+    cfg, index, root = tmp_env
+    sub = root / "Show.S01.COMPLETE[TGx]"
+    sub.mkdir()
+    (sub / "e01.txt").write_text("episode one")
+    Crawler(cfg, index).crawl()
+
+    _, removed, _ = apply_exclude(cfg, index, str(sub))
+    assert removed == 1
+    Crawler(cfg, index).crawl()
+    assert index.get_file_by_path(str((sub / "e01.txt").resolve()))["deleted"] == 1
