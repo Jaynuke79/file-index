@@ -39,8 +39,10 @@ file-index status            # queue stats, per-type counts, failures
 file-index watch             # incremental watcher (or install the systemd unit)
 ```
 
-`deep` is safe to interrupt (ctrl-c): it checkpoints after every file and
-resumes exactly where it left off. Re-running `scan` with no changes is
+`deep` is safe to interrupt (ctrl-c or `kill`): it finishes the current file,
+checkpoints, and unloads all Ollama models so the GPU is immediately free for
+other work (send the signal twice to skip the current file). It resumes
+exactly where it left off. Re-running `scan` with no changes is
 near-instant (size+mtime short-circuit, content-hash verification on change).
 
 ## Configuration

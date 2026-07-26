@@ -63,6 +63,39 @@ class OllamaClient:
                 if progress_cb:
                     progress_cb(msg)
 
+    def loaded_models(self) -> list[str]:
+        """Models currently resident in memory (GPU or CPU)."""
+        r = requests.get(f"{self.base_url}/api/ps", timeout=10)
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])]
+
+    def unload(self, model: str) -> None:
+        """Ask Ollama to evict the model now (keep_alive=0) instead of after
+        its idle timeout. Waits for any in-flight request on that model.
+        """
+        # /api/generate unloads generation models; embedding-only models
+        # reject generate, so fall back to /api/embed.
+        for endpoint, payload in (
+            ("generate", {"model": model, "keep_alive": 0}),
+            ("embed", {"model": model, "input": [], "keep_alive": 0}),
+        ):
+            r = requests.post(
+                f"{self.base_url}/api/{endpoint}", json=payload, timeout=self.timeout
+            )
+            if r.ok:
+                return
+
+    def unload_all(self) -> int:
+        """Best-effort eviction of every loaded model. Returns count evicted."""
+        try:
+            models = self.loaded_models()
+            for m in models:
+                self.unload(m)
+            return len(models)
+        except requests.RequestException as e:
+            log.debug("unload_all: %s", e)
+            return 0
+
     def embed(self, model: str, texts: list[str]) -> list[list[float]]:
         r = requests.post(
             f"{self.base_url}/api/embed",
