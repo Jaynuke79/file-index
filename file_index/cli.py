@@ -179,33 +179,46 @@ def deep() -> None:
 
     stop = {"flag": False}
 
-    def on_sigint(sig, frame):
+    def on_stop_signal(sig, frame):
+        if stop["flag"]:
+            raise SystemExit(130)  # second signal: stop now, skip current file
         stop["flag"] = True
-        console.print("\n[yellow]finishing current file, then stopping…[/yellow]")
+        console.print(
+            "\n[yellow]finishing current file, then stopping… (signal again to stop now)[/yellow]"
+        )
 
-    signal.signal(signal.SIGINT, on_sigint)
+    signal.signal(signal.SIGINT, on_stop_signal)
+    signal.signal(signal.SIGTERM, on_stop_signal)
 
-    with Progress(
-        SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
-        TextColumn("{task.completed}/{task.total}"), TimeElapsedColumn(),
-        console=console,
-    ) as prog:
-        task = prog.add_task("deep", total=total)
+    result = None
+    try:
+        with Progress(
+            SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
+            TextColumn("{task.completed}/{task.total}"), TimeElapsedColumn(),
+            console=console,
+        ) as prog:
+            task = prog.add_task("deep", total=total)
 
-        def cb(path, done, remaining, eta):
-            eta_s = f" ETA {int(eta // 60)}m{int(eta % 60):02d}s" if eta else ""
-            prog.update(task, completed=done, total=done + remaining,
-                        description=f"{Path(path).name[:36]}{eta_s}")
+            def cb(path, done, remaining, eta):
+                eta_s = f" ETA {int(eta // 60)}m{int(eta % 60):02d}s" if eta else ""
+                prog.update(task, completed=done, total=done + remaining,
+                            description=f"{Path(path).name[:36]}{eta_s}")
 
-        try:
-            result = worker.run(progress_cb=cb, stop_check=lambda: stop["flag"])
-        except Exception as e:  # noqa: BLE001
-            console.print(f"[red]{e}[/red]")
-            raise typer.Exit(1)
-    console.print(
-        f"tier 2: [green]{result['done']} processed[/green], [red]{result['failed']} failed[/red], "
-        f"{worker.pending_count()} remaining"
-    )
+            try:
+                result = worker.run(progress_cb=cb, stop_check=lambda: stop["flag"])
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]{e}[/red]")
+                raise typer.Exit(1)
+    finally:
+        # Don't leave a ~20 GB model squatting in VRAM after we stop.
+        n = OllamaClient(cfg.models.ollama_url).unload_all()
+        if n:
+            console.print(f"[dim]freed GPU memory ({n} model(s) unloaded)[/dim]")
+    if result is not None:
+        console.print(
+            f"tier 2: [green]{result['done']} processed[/green], [red]{result['failed']} failed[/red], "
+            f"{worker.pending_count()} remaining"
+        )
 
 
 @app.command()
