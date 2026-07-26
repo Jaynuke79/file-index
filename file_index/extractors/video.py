@@ -9,9 +9,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import tempfile
 from pathlib import Path
+
+# OpenCV (PySceneDetect's decode backend) lets ffmpeg log straight to stderr,
+# which floods the console on damaged streams. Must be set before cv2 loads.
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")  # AV_LOG_QUIET
 
 from ..ollama_client import OllamaClient
 from . import audio as audio_ex
@@ -118,7 +123,7 @@ def process_video(
     """
     scenes = detect_scenes(path, fallback_interval_s)
     if not scenes:
-        raise ValueError(f"could not determine scenes/duration for {path}")
+        raise ValueError(f"no readable video stream in {path} — file is likely corrupt or truncated")
     log.info("%s: %d scenes", path.name, len(scenes))
 
     scene_results = []
