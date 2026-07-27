@@ -352,6 +352,19 @@ class Index:
     def next_pending(
         self, tier: int, kind_priority: list[str] | None = None, newest_first: bool = True
     ) -> sqlite3.Row | None:
+        rows = self.peek_pending(tier, kind_priority, newest_first, limit=1)
+        return rows[0] if rows else None
+
+    def peek_pending(
+        self,
+        tier: int,
+        kind_priority: list[str] | None = None,
+        newest_first: bool = True,
+        limit: int = 1,
+    ) -> list[sqlite3.Row]:
+        """The next `limit` pending items in processing order, without claiming
+        them. Row 0 is what `next_pending` would return; the rest let the deep
+        worker prefetch CPU work for upcoming files."""
         status = PENDING_METADATA if tier == 1 else PENDING_DEEP
         order = []
         if kind_priority:
@@ -364,9 +377,9 @@ class Index:
             f"SELECT q.*, f.path, f.kind AS file_kind, f.mime FROM queue q "
             f"JOIN files f ON f.id=q.file_id "
             f"WHERE q.status=? AND q.tier=? AND f.deleted=0 "
-            f"ORDER BY {', '.join(order)} LIMIT 1",
-            (status, tier),
-        ).fetchone()
+            f"ORDER BY {', '.join(order)} LIMIT ?",
+            (status, tier, limit),
+        ).fetchall()
 
     def mark_done(self, queue_id: int) -> None:
         self.db.execute(

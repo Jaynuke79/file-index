@@ -47,6 +47,20 @@ other work (send the signal twice to skip the current file). It resumes
 exactly where it left off. Re-running `scan` with no changes is
 near-instant (size+mtime short-circuit, content-hash verification on change).
 
+`deep` overlaps CPU and GPU work: while the GPU runs the current file's models,
+background threads prepare the next files (image transcode/downscale, video
+scene detection — `deep.prefetch_files`, default 2), and within a video, ffmpeg
+frame/audio extraction runs on `deep.video_frame_workers` threads (default 4)
+while the VLM captions. Whisper still runs after the VLM per file so both never
+compete for VRAM. Note that a stop may additionally wait for an in-flight
+prefetch (at most one scene detection) to finish.
+
+When a video sits in a folder with already-summarized siblings, the captioner
+and summarizer get those summaries as background (`deep.neighbor_context`,
+default 3 siblings, 0 to disable) — so the 40th replay in your Smite folder is
+described knowing the other 39 were Smite matches, and recurring
+people/activities carry across clips.
+
 ## Configuration
 
 `~/.config/file-index/config.yaml` — created by `init`. Everything is swappable

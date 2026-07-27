@@ -30,8 +30,13 @@ CAPTION_PROMPT = (
     "visible, any readable text. Be concrete and specific."
 )
 
-SUMMARY_PROMPT = """You are summarizing a video from its scene captions and audio transcript.
+CAPTION_CONTEXT_SUFFIX = (
+    "\nBackground: other videos from the same folder were about the following "
+    "(this frame may or may not match — describe only what you actually see):\n{context}"
+)
 
+SUMMARY_PROMPT = """You are summarizing a video from its scene captions and audio transcript.
+{context}
 Scene captions (timestamped):
 {captions}
 
@@ -39,7 +44,14 @@ Audio transcript (timestamped):
 {transcript}
 
 Write a coherent summary of the video: what it is, what happens over time, key
-topics or events, and anything notable. 1-3 paragraphs. /no_think"""
+topics or events, and anything notable. If the background context above helps
+identify the game, activity, or recurring people, use it. 1-3 paragraphs. /no_think"""
+
+SUMMARY_CONTEXT_BLOCK = """
+Background — summaries of other videos from the same folder (may describe the
+same game, activity, or people):
+{context}
+"""
 
 
 def detect_scenes(path: Path, fallback_interval_s: float = 10.0) -> list[tuple[float, float]]:
@@ -117,11 +129,24 @@ def process_video(
     whisper_model: str = "large-v3",
     whisper_device: str = "cuda",
     whisper_compute_type: str = "float16",
+    scenes: list[tuple[float, float]] | None = None,
+    frame_workers: int = 4,
+    context: str = "",
 ) -> dict:
     """Full pipeline. Returns:
     {scenes: [{start, end, captions: [str]}], transcript: {...}|None, summary: str}
+
+    `scenes` can be supplied by a caller that already ran `detect_scenes` (the
+    deep worker prefetches it for the next video while the GPU is busy).
+    ffmpeg frame/audio extraction runs on `frame_workers` threads so the CPU
+    stays ahead of the GPU instead of alternating with it per scene.
+    `context` is optional background from already-indexed sibling videos
+    (e.g. "these are Smite matches"), fed to the captioner and summarizer.
     """
-    scenes = detect_scenes(path, fallback_interval_s)
+    from concurrent.futures import ThreadPoolExecutor
+
+    if scenes is None:
+        scenes = detect_scenes(path, fallback_interval_s)
     if not scenes:
         raise ValueError(f"no readable video stream in {path} — file is likely corrupt or truncated")
     log.info("%s: %d scenes", path.name, len(scenes))
@@ -129,30 +154,41 @@ def process_video(
     scene_results = []
     with tempfile.TemporaryDirectory(prefix="file-index-video-") as tmp:
         tmpdir = Path(tmp)
-        for i, (start, end) in enumerate(scenes):
-            span = end - start
-            n = max(1, min(frames_per_scene, 2))
-            offsets = [start + span * 0.5] if n == 1 or span < 2 else [
-                start + span * 0.25, start + span * 0.75
-            ]
-            captions = []
-            for j, ts in enumerate(offsets):
-                frame = extract_frame(path, ts, tmpdir / f"s{i}_f{j}.jpg")
-                if not frame:
-                    continue
-                try:
-                    cap = client.generate(vision_model, CAPTION_PROMPT, images=[frame])
-                    captions.append(cap.strip())
-                except Exception as e:  # noqa: BLE001 — keep other scenes going
-                    log.warning("caption failed scene %d of %s: %s", i, path, e)
-            scene_results.append(
-                {"start": round(start, 2), "end": round(end, 2), "captions": captions}
+        with ThreadPoolExecutor(max_workers=max(1, frame_workers)) as pool:
+            wav_future = pool.submit(extract_audio_track, path, tmpdir / "audio.wav")
+            frame_futures = []
+            for i, (start, end) in enumerate(scenes):
+                span = end - start
+                n = max(1, min(frames_per_scene, 2))
+                offsets = [start + span * 0.5] if n == 1 or span < 2 else [
+                    start + span * 0.25, start + span * 0.75
+                ]
+                frame_futures.append([
+                    pool.submit(extract_frame, path, ts, tmpdir / f"s{i}_f{j}.jpg")
+                    for j, ts in enumerate(offsets)
+                ])
+            caption_prompt = CAPTION_PROMPT + (
+                CAPTION_CONTEXT_SUFFIX.format(context=context) if context else ""
             )
+            for i, (start, end) in enumerate(scenes):
+                captions = []
+                for fut in frame_futures[i]:
+                    frame = fut.result()
+                    if not frame:
+                        continue
+                    try:
+                        cap = client.generate(vision_model, caption_prompt, images=[frame])
+                        captions.append(cap.strip())
+                    except Exception as e:  # noqa: BLE001 — keep other scenes going
+                        log.warning("caption failed scene %d of %s: %s", i, path, e)
+                scene_results.append(
+                    {"start": round(start, 2), "end": round(end, 2), "captions": captions}
+                )
+            wav = wav_future.result()
 
         # Whisper on the audio track (after VLM so Ollama can swap models freely;
         # Whisper is a separate CUDA process anyway).
         transcript = None
-        wav = extract_audio_track(path, tmpdir / "audio.wav")
         if wav:
             try:
                 transcript = audio_ex.transcribe(
@@ -174,7 +210,11 @@ def process_video(
     try:
         summary = client.generate(
             agent_model,
-            SUMMARY_PROMPT.format(captions=captions_text, transcript=transcript_text),
+            SUMMARY_PROMPT.format(
+                context=SUMMARY_CONTEXT_BLOCK.format(context=context) if context else "",
+                captions=captions_text,
+                transcript=transcript_text,
+            ),
         ).strip()
     except Exception as e:  # noqa: BLE001
         log.warning("video summary failed for %s: %s", path, e)
