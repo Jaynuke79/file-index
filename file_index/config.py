@@ -65,6 +65,17 @@ class DeepConfig:
     video_fallback_interval_s: float = 10.0
     whisper_device: str = "cuda"
     whisper_compute_type: str = "float16"
+    # CPU work (image transcode/downscale, video scene detection) for upcoming
+    # queue items runs in background threads while the GPU processes the
+    # current file. 0 disables prefetching.
+    prefetch_files: int = 2
+    # Parallel ffmpeg frame/audio extractions per video while the VLM captions.
+    video_frame_workers: int = 4
+    # When deep-processing a video, feed the captioner/summarizer the summaries
+    # of up to this many already-indexed videos from the same folder, so a
+    # folder of similar clips (same game, same people) is understood as such.
+    # 0 disables.
+    neighbor_context: int = 3
 
 
 @dataclass
@@ -132,6 +143,9 @@ class Config:
                 "video_fallback_interval_s": self.deep.video_fallback_interval_s,
                 "whisper_device": self.deep.whisper_device,
                 "whisper_compute_type": self.deep.whisper_compute_type,
+                "prefetch_files": self.deep.prefetch_files,
+                "video_frame_workers": self.deep.video_frame_workers,
+                "neighbor_context": self.deep.neighbor_context,
             },
         }
 
@@ -192,6 +206,9 @@ def load_config(path: Path | None = None) -> Config:
         video_fallback_interval_s=float(d.get("video_fallback_interval_s", cfg.deep.video_fallback_interval_s)),
         whisper_device=d.get("whisper_device", cfg.deep.whisper_device),
         whisper_compute_type=d.get("whisper_compute_type", cfg.deep.whisper_compute_type),
+        prefetch_files=int(d.get("prefetch_files", cfg.deep.prefetch_files)),
+        video_frame_workers=int(d.get("video_frame_workers", cfg.deep.video_frame_workers)),
+        neighbor_context=int(d.get("neighbor_context", cfg.deep.neighbor_context)),
     )
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     return cfg

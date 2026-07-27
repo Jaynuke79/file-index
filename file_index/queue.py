@@ -6,7 +6,9 @@ so kill/restart resumes exactly where it left off).
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from .config import Config
@@ -113,8 +115,33 @@ class Tier1Worker:
         self.index.store_chunks(file_id, content_id, stage, self._embed(chunks))
 
 
+def _prepare_cpu(kind: str, path: Path, fallback_interval_s: float) -> dict | None:
+    """CPU-only preparation for an upcoming queue item, run on a background
+    thread while the GPU processes the current file: image transcode/downscale,
+    video scene detection. Must not touch the DB (SQLite conn is not shared).
+    """
+    if kind == "image":
+        tdir = tempfile.TemporaryDirectory(prefix="file-index-prep-")
+        try:
+            vlm_path = image_ex.prepare_for_vlm(path, Path(tdir.name))
+        except Exception:
+            tdir.cleanup()
+            raise
+        return {"tmpdir": tdir, "vlm_path": vlm_path}
+    if kind == "video":
+        from .extractors import video as video_ex
+
+        return {"scenes": video_ex.detect_scenes(path, fallback_interval_s)}
+    return None
+
+
 class Tier2Worker:
-    """Deep pass: VLM images, scanned PDFs, Whisper audio, full video pipeline."""
+    """Deep pass: VLM images, scanned PDFs, Whisper audio, full video pipeline.
+
+    While the GPU works on the current file, `deep.prefetch_files` background
+    threads run the CPU-heavy prep of the next queue items (image decode and
+    downscale, video scene detection) so neither processor waits on the other.
+    """
 
     def __init__(self, config: Config, index: Index, client: OllamaClient | None = None):
         self.config = config
@@ -135,59 +162,117 @@ class Tier2Worker:
         if "pdf_scan" not in priority:
             priority.insert(0, "pdf_scan")
         start_time = time.time()
-        total_at_start = self.pending_count()
-        while True:
-            if stop_check and stop_check():
-                break
-            item = self.index.next_pending(
-                tier=2, kind_priority=priority, newest_first=self.config.deep.newest_first
-            )
-            if item is None:
-                break
-            path = Path(item["path"])
-            if progress_cb:
-                elapsed = time.time() - start_time
-                remaining = self.pending_count()
-                rate = done / elapsed if elapsed > 3 and done else None
-                eta = remaining / rate if rate else None
-                progress_cb(str(path), done, remaining, eta)
-            try:
-                self._process(item, path)
-                self.index.mark_done(item["id"])
-                self.index.set_tier_status(item["file_id"], 2, "done")
-                done += 1
-            except FileNotFoundError:
-                self.index.mark_failed(item["id"], "file disappeared during processing",
-                                       self.config.limits.max_retries)
-                self.index.mark_deleted(item["file_id"])
-                failed += 1
-            except Exception as e:  # noqa: BLE001
-                log.exception("tier2 failed on %s", path)
-                self.index.mark_failed(item["id"], f"{type(e).__name__}: {e}",
-                                       self.config.limits.max_retries)
-                row = self.index.db.execute(
-                    "SELECT status FROM queue WHERE id=?", (item["id"],)
-                ).fetchone()
-                if row and row["status"] == "failed":
-                    self.index.set_tier_status(item["file_id"], 2, "failed")
+        prefetch_n = max(0, self.config.deep.prefetch_files)
+        executor = (
+            ThreadPoolExecutor(max_workers=prefetch_n, thread_name_prefix="prefetch")
+            if prefetch_n
+            else None
+        )
+        prefetched: dict[int, Future] = {}
+        try:
+            while True:
+                if stop_check and stop_check():
+                    break
+                item = self.index.next_pending(
+                    tier=2, kind_priority=priority, newest_first=self.config.deep.newest_first
+                )
+                if item is None:
+                    break
+                if executor:
+                    self._top_up_prefetch(executor, prefetched, priority,
+                                          current_id=item["id"], depth=prefetch_n)
+                prep = self._take_prep(prefetched, item["id"])
+                path = Path(item["path"])
+                if progress_cb:
+                    elapsed = time.time() - start_time
+                    remaining = self.pending_count()
+                    rate = done / elapsed if elapsed > 3 and done else None
+                    eta = remaining / rate if rate else None
+                    progress_cb(str(path), done, remaining, eta)
+                try:
+                    self._process(item, path, prep)
+                    self.index.mark_done(item["id"])
+                    self.index.set_tier_status(item["file_id"], 2, "done")
+                    done += 1
+                except FileNotFoundError:
+                    self.index.mark_failed(item["id"], "file disappeared during processing",
+                                           self.config.limits.max_retries)
+                    self.index.mark_deleted(item["file_id"])
                     failed += 1
-            self.index.commit()  # checkpoint after every file
+                except Exception as e:  # noqa: BLE001
+                    log.exception("tier2 failed on %s", path)
+                    self.index.mark_failed(item["id"], f"{type(e).__name__}: {e}",
+                                           self.config.limits.max_retries)
+                    row = self.index.db.execute(
+                        "SELECT status FROM queue WHERE id=?", (item["id"],)
+                    ).fetchone()
+                    if row and row["status"] == "failed":
+                        self.index.set_tier_status(item["file_id"], 2, "failed")
+                        failed += 1
+                finally:
+                    if prep and prep.get("tmpdir"):
+                        prep["tmpdir"].cleanup()
+                self.index.commit()  # checkpoint after every file
+        finally:
+            if executor:
+                executor.shutdown(wait=False, cancel_futures=True)
+                for fut in prefetched.values():
+                    if fut.done() and not fut.cancelled() and fut.exception() is None:
+                        prep = fut.result()
+                        if prep and prep.get("tmpdir"):
+                            prep["tmpdir"].cleanup()
         return {"done": done, "failed": failed}
 
-    def _process(self, item, path: Path) -> None:
+    def _top_up_prefetch(
+        self,
+        executor: ThreadPoolExecutor,
+        prefetched: dict[int, Future],
+        priority: list[str],
+        current_id: int,
+        depth: int,
+    ) -> None:
+        """Queue CPU prep for the next `depth` items after the current one."""
+        upcoming = self.index.peek_pending(
+            tier=2, kind_priority=priority,
+            newest_first=self.config.deep.newest_first, limit=depth + 1,
+        )
+        for it in upcoming:
+            qid = it["id"]
+            kind = it["kind"] or it["file_kind"]
+            if qid == current_id or qid in prefetched or kind not in ("image", "video"):
+                continue
+            prefetched[qid] = executor.submit(
+                _prepare_cpu, kind, Path(it["path"]),
+                self.config.deep.video_fallback_interval_s,
+            )
+
+    @staticmethod
+    def _take_prep(prefetched: dict[int, Future], queue_id: int) -> dict | None:
+        """Collect this item's prefetched prep, waiting if it is still running
+        (the work has already started — waiting beats redoing it inline)."""
+        fut = prefetched.pop(queue_id, None)
+        if fut is None:
+            return None
+        try:
+            return fut.result()
+        except Exception as e:  # noqa: BLE001 — prep is best-effort
+            log.debug("prefetch failed (%s); processing inline", e)
+            return None
+
+    def _process(self, item, path: Path, prep: dict | None = None) -> None:
         if not path.exists():
             raise FileNotFoundError(path)
         if self._reuse_duplicate(item, path):
             return
         kind = item["kind"] or item["file_kind"]
         if kind == "image":
-            self._process_image(item, path)
+            self._process_image(item, path, prep)
         elif kind == "pdf_scan":
             self._process_pdf_scan(item, path)
         elif kind == "audio":
             self._process_audio(item, path)
         elif kind == "video":
-            self._process_video(item, path)
+            self._process_video(item, path, prep)
         else:
             log.info("no tier-2 handler for kind=%s (%s)", kind, path)
 
@@ -208,9 +293,10 @@ class Tier2Worker:
             log.info("reused deep results of identical %s for %s", row["path"], path)
         return n > 0
 
-    def _process_image(self, item, path: Path) -> None:
+    def _process_image(self, item, path: Path, prep: dict | None = None) -> None:
         data, raw, degraded = image_ex.analyze_image(
-            self.client, self.config.models.vision, path
+            self.client, self.config.models.vision, path,
+            prepared=prep.get("vlm_path") if prep else None,
         )
         if degraded:
             self.index.store_content(
@@ -225,6 +311,29 @@ class Tier2Worker:
                             self.config.limits.chunk_overlap_tokens)
         self.index.store_chunks(item["file_id"], cid, "vlm_image",
                                 self.embedder.embed_chunks(chunks))
+
+    def _neighbor_context(self, file_id: int, path: Path) -> str:
+        """Digest of already-summarized videos in the same folder, used to prime
+        the captioner/summarizer when a folder holds many similar clips (same
+        game, same recurring people). Empty string when disabled or no siblings.
+        """
+        n = self.config.deep.neighbor_context
+        if n <= 0:
+            return ""
+        prefix = str(path.parent) + "/"
+        esc = prefix.replace("\\", r"\\").replace("%", r"\%").replace("_", r"\_")
+        rows = self.index.db.execute(
+            "SELECT c.body FROM content c JOIN files f ON f.id=c.file_id "
+            "WHERE c.stage='video_summary' AND f.id != ? AND f.deleted=0 "
+            "AND f.path LIKE ? ESCAPE '\\' AND f.path NOT LIKE ? ESCAPE '\\' "
+            "ORDER BY f.mtime DESC LIMIT ?",
+            (file_id, esc + "%", esc + "%/%", n),
+        ).fetchall()
+        parts = []
+        for r in rows:
+            if r["body"]:
+                parts.append("- " + " ".join(r["body"].split())[:300])
+        return "\n".join(parts)
 
     def _process_pdf_scan(self, item, path: Path) -> None:
         import tempfile
@@ -293,7 +402,7 @@ class Tier2Worker:
             except Exception as e:  # noqa: BLE001 — transcript already stored
                 log.warning("audio summary failed for %s: %s", path, e)
 
-    def _process_video(self, item, path: Path) -> None:
+    def _process_video(self, item, path: Path, prep: dict | None = None) -> None:
         from .extractors import audio as audio_ex
         from .extractors import video as video_ex
 
@@ -307,6 +416,9 @@ class Tier2Worker:
             whisper_model=self.config.models.whisper,
             whisper_device=self.config.deep.whisper_device,
             whisper_compute_type=self.config.deep.whisper_compute_type,
+            scenes=prep.get("scenes") if prep else None,
+            frame_workers=self.config.deep.video_frame_workers,
+            context=self._neighbor_context(item["file_id"], path),
         )
         file_id = item["file_id"]
 

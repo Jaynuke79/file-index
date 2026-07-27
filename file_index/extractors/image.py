@@ -148,27 +148,40 @@ def prepare_for_vlm(path: Path, tmpdir: Path) -> Path:
 
 
 def analyze_image(
-    client: OllamaClient, model: str, path: Path
+    client: OllamaClient, model: str, path: Path, prepared: Path | None = None
 ) -> tuple[dict | None, str, bool]:
-    """Run the VLM. Returns (validated_json_or_None, raw_output, degraded)."""
+    """Run the VLM. Returns (validated_json_or_None, raw_output, degraded).
+
+    `prepared` is an already-VLM-safe image (from `prepare_for_vlm`, e.g. made
+    ahead of time by the deep worker's prefetcher); when given, the preprocess
+    step is skipped.
+    """
     import tempfile
 
+    if prepared is not None and prepared.exists():
+        return _analyze_prepared(client, model, path, prepared)
     with tempfile.TemporaryDirectory(prefix="file-index-vlm-") as tmp:
         try:
             safe = prepare_for_vlm(path, Path(tmp))
         except Exception as e:  # noqa: BLE001 — undecodable image: let the VLM try raw
             log.warning("could not preprocess %s (%s); sending as-is", path, e)
             safe = path
-        raw = client.generate(model, VLM_PROMPT, images=[safe], format_json=True)
-        data = validate_vlm_json(raw)
-        if data is not None:
-            return data, raw, False
-        log.info("VLM JSON invalid for %s, retrying once", path)
-        raw = client.generate(model, VLM_PROMPT, images=[safe], format_json=True)
-        data = validate_vlm_json(raw)
-        if data is not None:
-            return data, raw, False
-        return None, raw, True
+        return _analyze_prepared(client, model, path, safe)
+
+
+def _analyze_prepared(
+    client: OllamaClient, model: str, path: Path, safe: Path
+) -> tuple[dict | None, str, bool]:
+    raw = client.generate(model, VLM_PROMPT, images=[safe], format_json=True)
+    data = validate_vlm_json(raw)
+    if data is not None:
+        return data, raw, False
+    log.info("VLM JSON invalid for %s, retrying once", path)
+    raw = client.generate(model, VLM_PROMPT, images=[safe], format_json=True)
+    data = validate_vlm_json(raw)
+    if data is not None:
+        return data, raw, False
+    return None, raw, True
 
 
 def vlm_body_text(data: dict) -> str:
