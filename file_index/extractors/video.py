@@ -132,6 +132,7 @@ def process_video(
     scenes: list[tuple[float, float]] | None = None,
     frame_workers: int = 4,
     context: str = "",
+    summarize: bool = True,
 ) -> dict:
     """Full pipeline. Returns:
     {scenes: [{start, end, captions: [str]}], transcript: {...}|None, summary: str}
@@ -142,6 +143,9 @@ def process_video(
     stays ahead of the GPU instead of alternating with it per scene.
     `context` is optional background from already-indexed sibling videos
     (e.g. "these are Smite matches"), fed to the captioner and summarizer.
+    With `summarize=False` the agent-model summary is skipped (summary="");
+    the deep worker defers it to an end-of-run sweep via `summarize_video` so
+    the vision model is not swapped out of VRAM per video.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -207,17 +211,38 @@ def process_video(
         if transcript and transcript["segments"]
         else "(no speech / no audio track)"
     )
-    try:
-        summary = client.generate(
-            agent_model,
-            SUMMARY_PROMPT.format(
-                context=SUMMARY_CONTEXT_BLOCK.format(context=context) if context else "",
-                captions=captions_text,
-                transcript=transcript_text,
-            ),
-        ).strip()
-    except Exception as e:  # noqa: BLE001
-        log.warning("video summary failed for %s: %s", path, e)
-        summary = ""
+    summary = ""
+    if summarize:
+        try:
+            summary = summarize_video(
+                client, agent_model, captions_text, transcript_text, context
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("video summary failed for %s: %s", path, e)
 
-    return {"scenes": scene_results, "transcript": transcript, "summary": summary}
+    return {
+        "scenes": scene_results,
+        "transcript": transcript,
+        "summary": summary,
+        "captions_text": captions_text,
+        "transcript_text": transcript_text,
+    }
+
+
+def summarize_video(
+    client: OllamaClient,
+    agent_model: str,
+    captions_text: str,
+    transcript_text: str,
+    context: str = "",
+) -> str:
+    """Agent-model summary over caption/transcript text. Raises on model
+    failure so a deferred summary can be retried from the queue."""
+    return client.generate(
+        agent_model,
+        SUMMARY_PROMPT.format(
+            context=SUMMARY_CONTEXT_BLOCK.format(context=context) if context else "",
+            captions=captions_text,
+            transcript=transcript_text,
+        ),
+    ).strip()

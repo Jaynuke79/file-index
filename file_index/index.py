@@ -17,6 +17,10 @@ from pathlib import Path
 # Queue statuses
 PENDING_METADATA = "pending_metadata"
 PENDING_DEEP = "pending_deep"
+# Video whose captions+transcript are done but whose summary is deferred to the
+# end-of-run sweep (all summaries run with the agent model loaded once, instead
+# of a vision<->agent VRAM swap per video).
+PENDING_SUMMARY = "pending_summary"
 DONE = "done"
 FAILED = "failed"
 
@@ -350,9 +354,13 @@ class Index:
         )
 
     def next_pending(
-        self, tier: int, kind_priority: list[str] | None = None, newest_first: bool = True
+        self,
+        tier: int,
+        kind_priority: list[str] | None = None,
+        newest_first: bool = True,
+        status: str | None = None,
     ) -> sqlite3.Row | None:
-        rows = self.peek_pending(tier, kind_priority, newest_first, limit=1)
+        rows = self.peek_pending(tier, kind_priority, newest_first, limit=1, status=status)
         return rows[0] if rows else None
 
     def peek_pending(
@@ -361,11 +369,13 @@ class Index:
         kind_priority: list[str] | None = None,
         newest_first: bool = True,
         limit: int = 1,
+        status: str | None = None,
     ) -> list[sqlite3.Row]:
         """The next `limit` pending items in processing order, without claiming
         them. Row 0 is what `next_pending` would return; the rest let the deep
         worker prefetch CPU work for upcoming files."""
-        status = PENDING_METADATA if tier == 1 else PENDING_DEEP
+        if status is None:
+            status = PENDING_METADATA if tier == 1 else PENDING_DEEP
         order = []
         if kind_priority:
             cases = " ".join(
@@ -387,10 +397,24 @@ class Index:
             (DONE, time.time(), queue_id),
         )
 
-    def mark_failed(self, queue_id: int, error: str, max_retries: int = 3) -> None:
+    def set_queue_status(self, queue_id: int, status: str) -> None:
+        self.db.execute(
+            "UPDATE queue SET status=?, updated_at=? WHERE id=?",
+            (status, time.time(), queue_id),
+        )
+
+    def mark_failed(
+        self, queue_id: int, error: str, max_retries: int = 3,
+        retry_status: str | None = None,
+    ) -> None:
+        """`retry_status` overrides the status a retryable failure returns to
+        (e.g. a failed deferred summary goes back to pending_summary, not a
+        full re-run of the captions)."""
         row = self.db.execute("SELECT retries, tier FROM queue WHERE id=?", (queue_id,)).fetchone()
         retries = (row["retries"] if row else 0) + 1
-        pending = PENDING_METADATA if (row and row["tier"] == 1) else PENDING_DEEP
+        pending = retry_status or (
+            PENDING_METADATA if (row and row["tier"] == 1) else PENDING_DEEP
+        )
         status = FAILED if retries >= max_retries else pending
         self.db.execute(
             "UPDATE queue SET status=?, error=?, retries=?, updated_at=? WHERE id=?",

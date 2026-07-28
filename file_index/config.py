@@ -76,6 +76,11 @@ class DeepConfig:
     # folder of similar clips (same game, same people) is understood as such.
     # 0 disables.
     neighbor_context: int = 3
+    # Defer video summaries to an end-of-run sweep: all captioning runs with
+    # the vision model resident, then all summaries run with the agent model
+    # loaded once — instead of a ~15 s vision<->agent VRAM swap per video.
+    # Scenes/transcripts are stored immediately either way.
+    defer_video_summaries: bool = True
 
 
 @dataclass
@@ -146,6 +151,7 @@ class Config:
                 "prefetch_files": self.deep.prefetch_files,
                 "video_frame_workers": self.deep.video_frame_workers,
                 "neighbor_context": self.deep.neighbor_context,
+                "defer_video_summaries": self.deep.defer_video_summaries,
             },
         }
 
@@ -209,6 +215,7 @@ def load_config(path: Path | None = None) -> Config:
         prefetch_files=int(d.get("prefetch_files", cfg.deep.prefetch_files)),
         video_frame_workers=int(d.get("video_frame_workers", cfg.deep.video_frame_workers)),
         neighbor_context=int(d.get("neighbor_context", cfg.deep.neighbor_context)),
+        defer_video_summaries=bool(d.get("defer_video_summaries", cfg.deep.defer_video_summaries)),
     )
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     return cfg

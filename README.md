@@ -55,6 +55,14 @@ while the VLM captions. Whisper still runs after the VLM per file so both never
 compete for VRAM. Note that a stop may additionally wait for an in-flight
 prefetch (at most one scene detection) to finish.
 
+Video summaries are deferred to an end-of-run sweep
+(`deep.defer_video_summaries`, default true): every video's scene captions and
+transcript are stored (and searchable) immediately, then all summaries run with
+the agent model loaded once — avoiding a ~15 s vision↔agent VRAM swap per
+video. Interrupting mid-run is still safe: pending summaries persist in the
+queue and the next `deep` run picks them up; a failed summary retries without
+redoing captions.
+
 When a video sits in a folder with already-summarized siblings, the captioner
 and summarizer get those summaries as background (`deep.neighbor_context`,
 default 3 siblings, 0 to disable) — so the 40th replay in your Smite folder is
