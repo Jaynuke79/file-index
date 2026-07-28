@@ -435,7 +435,12 @@ def status() -> None:
         table.add_column(col, justify="right")
     t1, t2 = stats["tier1"], stats["tier2"]
     table.add_row("1 (metadata)", str(t1.get("pending_metadata", 0)), str(t1.get("done", 0)), str(t1.get("failed", 0)))
-    table.add_row("2 (deep)", str(t2.get("pending_deep", 0)), str(t2.get("done", 0)), str(t2.get("failed", 0)))
+    table.add_row(
+        "2 (deep)",
+        str(t2.get("pending_deep", 0) + t2.get("pending_summary", 0)),
+        str(t2.get("done", 0)),
+        str(t2.get("failed", 0)),
+    )
     console.print(table)
 
     kinds = Table(title="files by type")

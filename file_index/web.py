@@ -26,9 +26,12 @@ log = logging.getLogger("file_index.web")
 THUMB_SIZE = 512
 PAGE_LIMIT_MAX = 200
 
-# Stages that hold a human-readable caption, in preference order.
+# Stages that hold a human-readable caption, in preference order. The first
+# four are "real" captions (used for the captioned-only filter/count);
+# video_scenes covers videos whose deferred summary hasn't been generated yet.
 CAPTION_STAGES = (
-    "vlm_image", "video_summary", "audio_summary", "pdf_scan_vlm", "pdf_text", "text",
+    "vlm_image", "video_summary", "audio_summary", "pdf_scan_vlm",
+    "video_scenes", "pdf_text", "text",
 )
 
 

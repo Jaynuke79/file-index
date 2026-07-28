@@ -17,7 +17,7 @@ from .extractors import image as image_ex
 from .extractors import office as office_ex
 from .extractors import pdf as pdf_ex
 from .extractors import text as text_ex
-from .index import Index
+from .index import PENDING_SUMMARY, Index
 from .ollama_client import OllamaClient
 
 log = logging.getLogger("file_index.queue")
@@ -151,7 +151,8 @@ class Tier2Worker:
 
     def pending_count(self) -> int:
         row = self.index.db.execute(
-            "SELECT COUNT(*) n FROM queue WHERE tier=2 AND status='pending_deep'"
+            "SELECT COUNT(*) n FROM queue WHERE tier=2 "
+            "AND status IN ('pending_deep', 'pending_summary')"
         ).fetchone()
         return row["n"]
 
@@ -190,9 +191,12 @@ class Tier2Worker:
                     eta = remaining / rate if rate else None
                     progress_cb(str(path), done, remaining, eta)
                 try:
-                    self._process(item, path, prep)
-                    self.index.mark_done(item["id"])
-                    self.index.set_tier_status(item["file_id"], 2, "done")
+                    outcome = self._process(item, path, prep)
+                    if outcome == "defer_summary":
+                        self.index.set_queue_status(item["id"], PENDING_SUMMARY)
+                    else:
+                        self.index.mark_done(item["id"])
+                        self.index.set_tier_status(item["file_id"], 2, "done")
                     done += 1
                 except FileNotFoundError:
                     self.index.mark_failed(item["id"], "file disappeared during processing",
@@ -221,7 +225,66 @@ class Tier2Worker:
                         prep = fut.result()
                         if prep and prep.get("tmpdir"):
                             prep["tmpdir"].cleanup()
+        # All vision work is done — summarize every deferred video with the
+        # agent model loaded once, instead of swapping models per video.
+        s_failed = self._summary_sweep(progress_cb, stop_check, done)
+        failed += s_failed
         return {"done": done, "failed": failed}
+
+    def _summary_sweep(self, progress_cb, stop_check, done_so_far: int) -> int:
+        failed = 0
+        while True:
+            if stop_check and stop_check():
+                break
+            item = self.index.next_pending(
+                tier=2, status=PENDING_SUMMARY,
+                newest_first=self.config.deep.newest_first,
+            )
+            if item is None:
+                break
+            path = Path(item["path"])
+            if progress_cb:
+                progress_cb(str(path), done_so_far, self.pending_count(), None)
+            try:
+                self._summarize_deferred(item, path)
+                self.index.mark_done(item["id"])
+                self.index.set_tier_status(item["file_id"], 2, "done")
+            except Exception as e:  # noqa: BLE001 — never let one file kill the sweep
+                log.exception("deferred summary failed on %s", path)
+                self.index.mark_failed(item["id"], f"{type(e).__name__}: {e}",
+                                       self.config.limits.max_retries,
+                                       retry_status=PENDING_SUMMARY)
+                row = self.index.db.execute(
+                    "SELECT status FROM queue WHERE id=?", (item["id"],)
+                ).fetchone()
+                if row and row["status"] == "failed":
+                    self.index.set_tier_status(item["file_id"], 2, "failed")
+                    failed += 1
+            self.index.commit()  # checkpoint after every summary
+        return failed
+
+    def _summarize_deferred(self, item, path: Path) -> None:
+        """Generate + store the summary for a video whose captions/transcript
+        were stored earlier in the run (or a previous, interrupted run)."""
+        from .extractors import video as video_ex
+
+        file_id = item["file_id"]
+        scenes = self.index.get_content(file_id, "video_scenes")
+        transcript = self.index.get_content(file_id, "video_transcript")
+        captions_text = (scenes[0]["body"] if scenes else "") or "(no captions available)"
+        transcript_text = (transcript[0]["body"] if transcript else "") or "(no speech / no audio track)"
+        summary = _strip_think(video_ex.summarize_video(
+            self.client, self.config.models.agent, captions_text, transcript_text,
+            context=self._neighbor_context(file_id, path),
+        ))
+        if summary:
+            scid = self.index.store_content(
+                file_id, "video_summary", video_ex.VERSION, summary
+            )
+            schunks = chunk_text(summary, self.config.limits.chunk_tokens,
+                                 self.config.limits.chunk_overlap_tokens)
+            self.index.store_chunks(file_id, scid, "video_summary",
+                                    self.embedder.embed_chunks(schunks))
 
     def _top_up_prefetch(
         self,
@@ -259,11 +322,13 @@ class Tier2Worker:
             log.debug("prefetch failed (%s); processing inline", e)
             return None
 
-    def _process(self, item, path: Path, prep: dict | None = None) -> None:
+    def _process(self, item, path: Path, prep: dict | None = None) -> str | None:
+        """Returns "defer_summary" when the item must move to the summary
+        sweep instead of being marked done, else None."""
         if not path.exists():
             raise FileNotFoundError(path)
         if self._reuse_duplicate(item, path):
-            return
+            return None
         kind = item["kind"] or item["file_kind"]
         if kind == "image":
             self._process_image(item, path, prep)
@@ -272,9 +337,10 @@ class Tier2Worker:
         elif kind == "audio":
             self._process_audio(item, path)
         elif kind == "video":
-            self._process_video(item, path, prep)
+            return self._process_video(item, path, prep)
         else:
             log.info("no tier-2 handler for kind=%s (%s)", kind, path)
+        return None
 
     def _reuse_duplicate(self, item, path: Path) -> bool:
         """A byte-identical file (same hash) was already deep-processed under
@@ -333,6 +399,21 @@ class Tier2Worker:
         for r in rows:
             if r["body"]:
                 parts.append("- " + " ".join(r["body"].split())[:300])
+        if len(parts) < n:
+            # Siblings captioned this run but not yet summarized (summaries are
+            # deferred to the end-of-run sweep): use their scene captions.
+            more = self.index.db.execute(
+                "SELECT c.body FROM content c JOIN files f ON f.id=c.file_id "
+                "WHERE c.stage='video_scenes' AND f.id != ? AND f.deleted=0 "
+                "AND f.path LIKE ? ESCAPE '\\' AND f.path NOT LIKE ? ESCAPE '\\' "
+                "AND NOT EXISTS (SELECT 1 FROM content c2 "
+                "                WHERE c2.file_id=c.file_id AND c2.stage='video_summary') "
+                "ORDER BY f.mtime DESC LIMIT ?",
+                (file_id, esc + "%", esc + "%/%", n - len(parts)),
+            ).fetchall()
+            for r in more:
+                if r["body"]:
+                    parts.append("- (scene captions) " + " ".join(r["body"].split())[:300])
         return "\n".join(parts)
 
     def _process_pdf_scan(self, item, path: Path) -> None:
@@ -402,10 +483,11 @@ class Tier2Worker:
             except Exception as e:  # noqa: BLE001 — transcript already stored
                 log.warning("audio summary failed for %s: %s", path, e)
 
-    def _process_video(self, item, path: Path, prep: dict | None = None) -> None:
+    def _process_video(self, item, path: Path, prep: dict | None = None) -> str | None:
         from .extractors import audio as audio_ex
         from .extractors import video as video_ex
 
+        defer = self.config.deep.defer_video_summaries
         result = video_ex.process_video(
             path,
             self.client,
@@ -419,6 +501,7 @@ class Tier2Worker:
             scenes=prep.get("scenes") if prep else None,
             frame_workers=self.config.deep.video_frame_workers,
             context=self._neighbor_context(item["file_id"], path),
+            summarize=not defer,
         )
         file_id = item["file_id"]
 
@@ -462,6 +545,7 @@ class Tier2Worker:
                                  self.config.limits.chunk_overlap_tokens)
             self.index.store_chunks(file_id, scid, "video_summary",
                                     self.embedder.embed_chunks(schunks))
+        return "defer_summary" if defer else None
 
 
 def _strip_think(text: str) -> str:
