@@ -49,16 +49,21 @@ def test_transcription_runs_in_background_and_stores(tmp_env, monkeypatch):
     fids = [enqueue_video(index, root, f"v{i}.mp4", mtime=100.0 + i)[0] for i in range(3)]
     index.commit()
     monkeypatch.setattr(video_ex, "process_video", fake_process_video)
-    monkeypatch.setattr(
-        video_ex, "transcribe_video",
-        lambda path, *a, **k: {"language": "en", "duration": 5.0,
-                               "segments": [{"start": 0.0, "end": 2.0,
-                                             "text": f"speech in {Path(path).name}"}]},
-    )
+    devices = []
+
+    def fake_transcribe(path, model, device, compute):
+        devices.append(device)
+        return {"language": "en", "duration": 5.0,
+                "segments": [{"start": 0.0, "end": 2.0,
+                              "text": f"speech in {Path(path).name}"}]}
+
+    monkeypatch.setattr(video_ex, "transcribe_video", fake_transcribe)
 
     worker = Tier2Worker(cfg, index, client=FakeOllama())
     result = worker.run()
     assert result == {"done": 3, "failed": 0}
+    # background whisper must never take VRAM from the pinned vision model
+    assert devices and all(d == "cpu" for d in devices)
     for fid in fids:
         t = index.get_content(fid, "video_transcript")
         assert t and "speech in" in t[0]["body"]

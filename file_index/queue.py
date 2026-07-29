@@ -262,6 +262,11 @@ class Tier2Worker:
     ) -> None:
         """Feed the background transcription thread from pending_transcript
         rows (captions already stored, this run or an interrupted earlier one).
+
+        Whisper runs on CPU here regardless of deep.whisper_device: it is off
+        the GPU's critical path, and letting it grab VRAM first pushes the
+        (pinned) vision model into partial CPU offload, slowing every caption
+        ~30x. The configured device still applies to inline transcription.
         """
         from .extractors import video as video_ex
 
@@ -279,9 +284,7 @@ class Tier2Worker:
                 continue
             fut = transcriber.submit(
                 video_ex.transcribe_video, Path(it["path"]),
-                self.config.models.whisper,
-                self.config.deep.whisper_device,
-                self.config.deep.whisper_compute_type,
+                self.config.models.whisper, "cpu", "int8",
             )
             in_flight[it["id"]] = (fut, it)
 
