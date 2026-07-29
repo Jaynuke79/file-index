@@ -58,10 +58,11 @@ prefetch (at most one scene detection) to finish.
 Whisper transcription runs on a background thread: after a video's captions
 are stored it moves to a `pending_transcript` queue state, the GPU immediately
 starts the next video's captions, and the transcript is stored as it finishes.
-This matters because Whisper may silently fall back to CPU (`large-v3` doesn't
-fit next to a 32B vision model in 32 GB of VRAM) — off the critical path, a
-slow transcription no longer idles the GPU. Ollama models are pinned in VRAM
-for the whole run (`keep_alive`) and unloaded at the end.
+Background transcription always uses CPU (int8) regardless of
+`deep.whisper_device` — it is off the critical path, and Whisper grabbing VRAM
+first pushes the vision model into partial CPU offload, slowing every caption
+~30x. Ollama models are pinned in VRAM for the whole run (`keep_alive`) and
+unloaded at the end.
 
 Video summaries are deferred to an end-of-run sweep
 (`deep.defer_video_summaries`, default true): every video's scene captions and
