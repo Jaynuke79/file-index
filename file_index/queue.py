@@ -17,7 +17,7 @@ from .extractors import image as image_ex
 from .extractors import office as office_ex
 from .extractors import pdf as pdf_ex
 from .extractors import text as text_ex
-from .index import PENDING_SUMMARY, Index
+from .index import PENDING_SUMMARY, PENDING_TRANSCRIPT, Index
 from .ollama_client import OllamaClient
 
 log = logging.getLogger("file_index.queue")
@@ -152,12 +152,16 @@ class Tier2Worker:
     def pending_count(self) -> int:
         row = self.index.db.execute(
             "SELECT COUNT(*) n FROM queue WHERE tier=2 "
-            "AND status IN ('pending_deep', 'pending_summary')"
+            "AND status IN ('pending_deep', 'pending_transcript', 'pending_summary')"
         ).fetchone()
         return row["n"]
 
     def run(self, progress_cb=None, stop_check=None) -> dict:
         self.client.require()
+        # Pin models in VRAM for the whole run: a long CPU stretch (Whisper,
+        # scene detection) must not let Ollama idle-evict a ~20 GB model.
+        # The CLI unloads everything when the run ends.
+        self.client.keep_alive = -1
         done = failed = 0
         priority = list(self.config.deep.priority)
         if "pdf_scan" not in priority:
@@ -170,14 +174,22 @@ class Tier2Worker:
             else None
         )
         prefetched: dict[int, Future] = {}
+        transcriber = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcribe")
+        in_flight: dict[int, tuple[Future, dict]] = {}  # queue_id -> (future, item)
         try:
             while True:
                 if stop_check and stop_check():
                     break
+                self._drain_transcripts(in_flight, wait=False)
+                self._pump_transcripts(transcriber, in_flight)
                 item = self.index.next_pending(
                     tier=2, kind_priority=priority, newest_first=self.config.deep.newest_first
                 )
                 if item is None:
+                    # Captions are done; wait out the remaining transcriptions.
+                    if in_flight:
+                        self._drain_transcripts(in_flight, wait=True)
+                        continue
                     break
                 if executor:
                     self._top_up_prefetch(executor, prefetched, priority,
@@ -192,7 +204,9 @@ class Tier2Worker:
                     progress_cb(str(path), done, remaining, eta)
                 try:
                     outcome = self._process(item, path, prep)
-                    if outcome == "defer_summary":
+                    if outcome == "defer_transcript":
+                        self.index.set_queue_status(item["id"], PENDING_TRANSCRIPT)
+                    elif outcome == "defer_summary":
                         self.index.set_queue_status(item["id"], PENDING_SUMMARY)
                     else:
                         self.index.mark_done(item["id"])
@@ -225,11 +239,89 @@ class Tier2Worker:
                         prep = fut.result()
                         if prep and prep.get("tmpdir"):
                             prep["tmpdir"].cleanup()
+            transcriber.shutdown(wait=False, cancel_futures=True)
+            # A queued-but-cancelled job stays pending_transcript for the next
+            # run; a running one is about to block interpreter exit anyway, so
+            # wait for it and keep its result.
+            while in_flight:
+                for qid in [q for q, (f, _) in in_flight.items() if f.cancelled()]:
+                    in_flight.pop(qid)
+                if in_flight:
+                    self._drain_transcripts(in_flight, wait=True)
         # All vision work is done — summarize every deferred video with the
         # agent model loaded once, instead of swapping models per video.
         s_failed = self._summary_sweep(progress_cb, stop_check, done)
         failed += s_failed
         return {"done": done, "failed": failed}
+
+    def _pump_transcripts(
+        self,
+        transcriber: ThreadPoolExecutor,
+        in_flight: dict[int, tuple[Future, dict]],
+        max_in_flight: int = 2,
+    ) -> None:
+        """Feed the background transcription thread from pending_transcript
+        rows (captions already stored, this run or an interrupted earlier one).
+        """
+        from .extractors import video as video_ex
+
+        if len(in_flight) >= max_in_flight:
+            return
+        rows = self.index.peek_pending(
+            tier=2, status=PENDING_TRANSCRIPT,
+            newest_first=self.config.deep.newest_first,
+            limit=max_in_flight + len(in_flight),
+        )
+        for it in rows:
+            if len(in_flight) >= max_in_flight:
+                break
+            if it["id"] in in_flight:
+                continue
+            fut = transcriber.submit(
+                video_ex.transcribe_video, Path(it["path"]),
+                self.config.models.whisper,
+                self.config.deep.whisper_device,
+                self.config.deep.whisper_compute_type,
+            )
+            in_flight[it["id"]] = (fut, it)
+
+    def _drain_transcripts(
+        self, in_flight: dict[int, tuple[Future, dict]], wait: bool
+    ) -> None:
+        """Store finished transcriptions and advance their queue items to
+        pending_summary. With wait=True, block until at least one finishes."""
+        if not in_flight:
+            return
+        if wait:
+            from concurrent.futures import FIRST_COMPLETED
+            from concurrent.futures import wait as futures_wait
+
+            futures_wait([f for f, _ in in_flight.values()], return_when=FIRST_COMPLETED)
+        for qid in [q for q, (f, _) in in_flight.items() if f.done() and not f.cancelled()]:
+            fut, item = in_flight.pop(qid)
+            path = Path(item["path"])
+            try:
+                transcript = fut.result()
+            except Exception as e:  # noqa: BLE001 — a lost transcript is not fatal
+                log.warning("whisper failed for %s: %s", path, e)
+                transcript = None
+            if transcript and transcript["segments"]:
+                self._store_transcript(item["file_id"], transcript)
+            self.index.set_queue_status(qid, PENDING_SUMMARY)
+            self.index.commit()
+
+    def _store_transcript(self, file_id: int, t: dict) -> None:
+        from .extractors import audio as audio_ex
+
+        tcid = self.index.store_content(
+            file_id, "video_transcript", audio_ex.VERSION,
+            audio_ex.format_transcript(t["segments"]),
+            meta={"language": t["language"], "duration": t["duration"],
+                  "segments": t["segments"]},
+        )
+        tchunks = chunk_segments(t["segments"], self.config.limits.chunk_tokens)
+        self.index.store_chunks(file_id, tcid, "video_transcript",
+                                self.embedder.embed_chunks(tchunks))
 
     def _summary_sweep(self, progress_cb, stop_check, done_so_far: int) -> int:
         failed = 0
@@ -502,6 +594,9 @@ class Tier2Worker:
             frame_workers=self.config.deep.video_frame_workers,
             context=self._neighbor_context(item["file_id"], path),
             summarize=not defer,
+            transcribe=not defer,
+            max_scenes=self.config.deep.video_max_scenes,
+            dedup_frames=self.config.deep.video_dedup_frames,
         )
         file_id = item["file_id"]
 
@@ -525,16 +620,7 @@ class Tier2Worker:
                                 self.embedder.embed_chunks(scene_chunks))
 
         if result["transcript"] and result["transcript"]["segments"]:
-            t = result["transcript"]
-            tcid = self.index.store_content(
-                file_id, "video_transcript", audio_ex.VERSION,
-                audio_ex.format_transcript(t["segments"]),
-                meta={"language": t["language"], "duration": t["duration"],
-                      "segments": t["segments"]},
-            )
-            tchunks = chunk_segments(t["segments"], self.config.limits.chunk_tokens)
-            self.index.store_chunks(file_id, tcid, "video_transcript",
-                                    self.embedder.embed_chunks(tchunks))
+            self._store_transcript(file_id, result["transcript"])
 
         summary = _strip_think(result["summary"])
         if summary:
@@ -545,7 +631,7 @@ class Tier2Worker:
                                  self.config.limits.chunk_overlap_tokens)
             self.index.store_chunks(file_id, scid, "video_summary",
                                     self.embedder.embed_chunks(schunks))
-        return "defer_summary" if defer else None
+        return "defer_transcript" if defer else None
 
 
 def _strip_think(text: str) -> str:
