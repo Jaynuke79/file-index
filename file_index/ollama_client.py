@@ -24,6 +24,11 @@ class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:11434", timeout: int = 600):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # When set (e.g. -1 during a deep run), sent with every request so
+        # Ollama does not idle-evict the model mid-run — a long CPU stretch
+        # (Whisper, scene detection) must not cost a ~20 GB model reload.
+        # Callers that set this are responsible for unloading at the end.
+        self.keep_alive: int | str | None = None
 
     def ping(self) -> bool:
         try:
@@ -97,9 +102,12 @@ class OllamaClient:
             return 0
 
     def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+        payload: dict = {"model": model, "input": texts}
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
         r = requests.post(
             f"{self.base_url}/api/embed",
-            json={"model": model, "input": texts},
+            json=payload,
             timeout=self.timeout,
         )
         r.raise_for_status()
@@ -117,6 +125,8 @@ class OllamaClient:
         options: dict | None = None,
     ) -> str:
         payload: dict = {"model": model, "prompt": prompt, "stream": False}
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
         if images:
             payload["images"] = [
                 base64.b64encode(p.read_bytes()).decode() for p in images

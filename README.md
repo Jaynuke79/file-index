@@ -55,13 +55,27 @@ while the VLM captions. Whisper still runs after the VLM per file so both never
 compete for VRAM. Note that a stop may additionally wait for an in-flight
 prefetch (at most one scene detection) to finish.
 
+Whisper transcription runs on a background thread: after a video's captions
+are stored it moves to a `pending_transcript` queue state, the GPU immediately
+starts the next video's captions, and the transcript is stored as it finishes.
+This matters because Whisper may silently fall back to CPU (`large-v3` doesn't
+fit next to a 32B vision model in 32 GB of VRAM) — off the critical path, a
+slow transcription no longer idles the GPU. Ollama models are pinned in VRAM
+for the whole run (`keep_alive`) and unloaded at the end.
+
 Video summaries are deferred to an end-of-run sweep
 (`deep.defer_video_summaries`, default true): every video's scene captions and
 transcript are stored (and searchable) immediately, then all summaries run with
 the agent model loaded once — avoiding a ~15 s vision↔agent VRAM swap per
-video. Interrupting mid-run is still safe: pending summaries persist in the
-queue and the next `deep` run picks them up; a failed summary retries without
-redoing captions.
+video. Interrupting mid-run is still safe: pending transcripts and summaries
+persist in the queue and the next `deep` run picks them up; a failed summary
+retries without redoing captions.
+
+VLM work per video is bounded: scene-heavy videos are sampled down to
+`deep.video_max_scenes` scenes (default 40, evenly spread; 0 = no cap), and
+frames that are near-duplicates of already-captioned ones (perceptual hash —
+common in gameplay/screen recordings) are skipped
+(`deep.video_dedup_frames`).
 
 When a video sits in a folder with already-summarized siblings, the captioner
 and summarizer get those summaries as background (`deep.neighbor_context`,

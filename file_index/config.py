@@ -68,9 +68,16 @@ class DeepConfig:
     # CPU work (image transcode/downscale, video scene detection) for upcoming
     # queue items runs in background threads while the GPU processes the
     # current file. 0 disables prefetching.
-    prefetch_files: int = 2
+    prefetch_files: int = 4
     # Parallel ffmpeg frame/audio extractions per video while the VLM captions.
     video_frame_workers: int = 4
+    # Videos with more detected scenes than this are sampled down to this many,
+    # evenly spread across the timeline. 0 = caption every scene.
+    video_max_scenes: int = 40
+    # Skip VLM captioning of frames that are near-duplicates (perceptual hash)
+    # of frames already captioned in the same video — common in gameplay and
+    # screen recordings.
+    video_dedup_frames: bool = True
     # When deep-processing a video, feed the captioner/summarizer the summaries
     # of up to this many already-indexed videos from the same folder, so a
     # folder of similar clips (same game, same people) is understood as such.
@@ -150,6 +157,8 @@ class Config:
                 "whisper_compute_type": self.deep.whisper_compute_type,
                 "prefetch_files": self.deep.prefetch_files,
                 "video_frame_workers": self.deep.video_frame_workers,
+                "video_max_scenes": self.deep.video_max_scenes,
+                "video_dedup_frames": self.deep.video_dedup_frames,
                 "neighbor_context": self.deep.neighbor_context,
                 "defer_video_summaries": self.deep.defer_video_summaries,
             },
@@ -214,6 +223,8 @@ def load_config(path: Path | None = None) -> Config:
         whisper_compute_type=d.get("whisper_compute_type", cfg.deep.whisper_compute_type),
         prefetch_files=int(d.get("prefetch_files", cfg.deep.prefetch_files)),
         video_frame_workers=int(d.get("video_frame_workers", cfg.deep.video_frame_workers)),
+        video_max_scenes=int(d.get("video_max_scenes", cfg.deep.video_max_scenes)),
+        video_dedup_frames=bool(d.get("video_dedup_frames", cfg.deep.video_dedup_frames)),
         neighbor_context=int(d.get("neighbor_context", cfg.deep.neighbor_context)),
         defer_video_summaries=bool(d.get("defer_video_summaries", cfg.deep.defer_video_summaries)),
     )

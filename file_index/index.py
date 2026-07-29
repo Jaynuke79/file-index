@@ -17,6 +17,10 @@ from pathlib import Path
 # Queue statuses
 PENDING_METADATA = "pending_metadata"
 PENDING_DEEP = "pending_deep"
+# Video whose captions are stored but whose Whisper transcript is still being
+# produced on a background thread (or was interrupted mid-run) — the GPU moves
+# on to the next video's captions instead of waiting for transcription.
+PENDING_TRANSCRIPT = "pending_transcript"
 # Video whose captions+transcript are done but whose summary is deferred to the
 # end-of-run sweep (all summaries run with the agent model loaded once, instead
 # of a vision<->agent VRAM swap per video).

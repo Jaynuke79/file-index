@@ -104,6 +104,42 @@ def extract_frame(path: Path, timestamp: float, out_path: Path) -> Path | None:
         return None
 
 
+def sample_scenes(
+    scenes: list[tuple[float, float]], max_scenes: int
+) -> list[tuple[float, float]]:
+    """Evenly sample at most max_scenes across the timeline (0 = keep all)."""
+    if max_scenes <= 0 or len(scenes) <= max_scenes:
+        return scenes
+    step = len(scenes) / max_scenes
+    return [scenes[int(i * step)] for i in range(max_scenes)]
+
+
+def frame_dhash(path: Path) -> int | None:
+    """64-bit difference hash of an image; None if it cannot be decoded."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            px = img.convert("L").resize((9, 8)).tobytes()
+        bits = 0
+        for row in range(8):
+            for col in range(8):
+                bits = (bits << 1) | (px[row * 9 + col] > px[row * 9 + col + 1])
+        return bits
+    except Exception:  # noqa: BLE001 — dedup is best-effort
+        return None
+
+
+def _hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+# Frames within this hamming distance of an already-captioned frame are
+# considered near-duplicates and skipped (gameplay/screen recordings repeat
+# almost-identical frames across scene cuts).
+DHASH_NEAR_DUPLICATE = 6
+
+
 def extract_audio_track(path: Path, out_path: Path) -> Path | None:
     """Extract mono 16 kHz wav for Whisper. None if the video has no audio."""
     try:
@@ -133,6 +169,9 @@ def process_video(
     frame_workers: int = 4,
     context: str = "",
     summarize: bool = True,
+    transcribe: bool = True,
+    max_scenes: int = 0,
+    dedup_frames: bool = False,
 ) -> dict:
     """Full pipeline. Returns:
     {scenes: [{start, end, captions: [str]}], transcript: {...}|None, summary: str}
@@ -145,7 +184,11 @@ def process_video(
     (e.g. "these are Smite matches"), fed to the captioner and summarizer.
     With `summarize=False` the agent-model summary is skipped (summary="");
     the deep worker defers it to an end-of-run sweep via `summarize_video` so
-    the vision model is not swapped out of VRAM per video.
+    the vision model is not swapped out of VRAM per video. With
+    `transcribe=False` Whisper is skipped too (transcript=None); the worker
+    runs `transcribe_video` on a background thread so the GPU can move on.
+    `max_scenes` caps VLM work on scene-heavy videos; `dedup_frames` skips
+    frames that are near-duplicates of already-captioned ones.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -153,13 +196,23 @@ def process_video(
         scenes = detect_scenes(path, fallback_interval_s)
     if not scenes:
         raise ValueError(f"no readable video stream in {path} — file is likely corrupt or truncated")
-    log.info("%s: %d scenes", path.name, len(scenes))
+    total_scenes = len(scenes)
+    scenes = sample_scenes(scenes, max_scenes)
+    if len(scenes) < total_scenes:
+        log.info("%s: %d scenes (sampled down from %d)", path.name, len(scenes), total_scenes)
+    else:
+        log.info("%s: %d scenes", path.name, len(scenes))
 
     scene_results = []
+    skipped_dups = 0
+    seen_hashes: list[int] = []
     with tempfile.TemporaryDirectory(prefix="file-index-video-") as tmp:
         tmpdir = Path(tmp)
         with ThreadPoolExecutor(max_workers=max(1, frame_workers)) as pool:
-            wav_future = pool.submit(extract_audio_track, path, tmpdir / "audio.wav")
+            wav_future = (
+                pool.submit(extract_audio_track, path, tmpdir / "audio.wav")
+                if transcribe else None
+            )
             frame_futures = []
             for i, (start, end) in enumerate(scenes):
                 span = end - start
@@ -180,6 +233,13 @@ def process_video(
                     frame = fut.result()
                     if not frame:
                         continue
+                    if dedup_frames:
+                        h = frame_dhash(frame)
+                        if h is not None:
+                            if any(_hamming(h, s) <= DHASH_NEAR_DUPLICATE for s in seen_hashes):
+                                skipped_dups += 1
+                                continue
+                            seen_hashes.append(h)
                     try:
                         cap = client.generate(vision_model, caption_prompt, images=[frame])
                         captions.append(cap.strip())
@@ -188,10 +248,13 @@ def process_video(
                 scene_results.append(
                     {"start": round(start, 2), "end": round(end, 2), "captions": captions}
                 )
-            wav = wav_future.result()
+            wav = wav_future.result() if wav_future else None
+        if skipped_dups:
+            log.info("%s: skipped %d near-duplicate frames", path.name, skipped_dups)
 
-        # Whisper on the audio track (after VLM so Ollama can swap models freely;
-        # Whisper is a separate CUDA process anyway).
+        # Whisper on the audio track. Inline only when transcribe=True (the
+        # deep worker instead runs transcribe_video on a background thread so
+        # a slow — possibly CPU-fallback — transcription never idles the GPU).
         transcript = None
         if wav:
             try:
@@ -227,6 +290,24 @@ def process_video(
         "captions_text": captions_text,
         "transcript_text": transcript_text,
     }
+
+
+def transcribe_video(
+    path: Path,
+    whisper_model: str = "large-v3",
+    whisper_device: str = "cuda",
+    whisper_compute_type: str = "float16",
+) -> dict | None:
+    """Extract the audio track and Whisper-transcribe it. None when the video
+    has no audio. Runs standalone (own temp dir) so the deep worker can call it
+    on a background thread while the GPU captions the next video."""
+    with tempfile.TemporaryDirectory(prefix="file-index-transcribe-") as tmp:
+        wav = extract_audio_track(path, Path(tmp) / "audio.wav")
+        if not wav:
+            return None
+        return audio_ex.transcribe(
+            wav, whisper_model, whisper_device, whisper_compute_type
+        )
 
 
 def summarize_video(
