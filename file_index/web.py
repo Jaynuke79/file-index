@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .config import Config
+from .util import fts_escape as _fts_escape
 
 log = logging.getLogger("file_index.web")
 
@@ -33,12 +34,6 @@ CAPTION_STAGES = (
     "vlm_image", "video_summary", "audio_summary", "pdf_scan_vlm",
     "video_scenes", "pdf_text", "text",
 )
-
-
-def _fts_escape(query: str) -> str:
-    """Quote each term so user input is never parsed as FTS5 syntax."""
-    terms = [t for t in re.split(r"\s+", query.strip()) if t]
-    return " ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
 class Store:
