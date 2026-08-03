@@ -36,6 +36,8 @@ def populated(tmp_env):
     index.store_content(fid_txt, "text", "text-1.0", "meeting notes about taxes")
 
     fid_gone = index.upsert_file(str(root / "gone.png"), "h4", 5, 400.0, "image/png", "image")
+    # captioned BEFORE deletion: must not count toward summary()["captioned"]
+    index.store_content(fid_gone, "vlm_image", "image-1.2", "an old screenshot")
     index.mark_deleted(fid_gone)
 
     index.commit()
@@ -162,6 +164,32 @@ def test_http_media_and_ranges(server):
     status, _, _ = _get(f"{base}/media/{ids['img']}", {"Range": f"bytes={len(full) + 10}-"})
     assert status == 416
 
+    # malformed range (start > end) is ignored: full 200 response
+    status, headers, body = _get(f"{base}/media/{ids['img']}", {"Range": "bytes=500-100"})
+    assert status == 200
+    assert body == full
+    assert int(headers["Content-Length"]) == len(full)
+
     # deleted files are never served
     status, _, _ = _get(f"{base}/media/{ids['gone']}")
     assert status == 404
+
+
+def test_browse_without_index_errors_and_creates_no_db(tmp_path, monkeypatch):
+    """`browse` on a fresh machine must say "run scan first", not create an
+    empty db (constructing Index would create the file and defeat the check)."""
+    from typer.testing import CliRunner
+
+    from file_index import cli
+    from file_index.config import Config
+
+    cfg = Config()
+    cfg.roots = [tmp_path]
+    cfg.data_dir = tmp_path / "state"
+    cfg.data_dir.mkdir()
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["browse", "--no-open"])
+    assert result.exit_code == 1
+    assert "scan" in result.output
+    assert not cfg.db_path.exists()
