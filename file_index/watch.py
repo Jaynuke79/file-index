@@ -110,5 +110,7 @@ class Watcher:
                         self.index.commit()
                         if on_event:
                             on_event("removed", path_s)
-            except (OSError, PermissionError) as e:
+            except Exception as e:  # noqa: BLE001 — one bad path must never
+                # kill the daemon (sqlite lock contention with a concurrent
+                # scan/deep run, extractor errors via on_event, …)
                 log.warning("watch: error handling %s: %s", path_s, e)
