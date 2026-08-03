@@ -21,6 +21,7 @@ os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")  # AV_LOG_QUIET
 from ..ollama_client import OllamaClient
 from ..util import format_ts
 from . import audio as audio_ex
+from . import image as image_ex
 
 log = logging.getLogger("file_index.extractors.video")
 
@@ -97,11 +98,22 @@ def probe_duration(path: Path) -> float:
 
 
 def extract_frame(path: Path, timestamp: float, out_path: Path) -> Path | None:
+    """Grab one frame, downscaled to the VLM's input limit.
+
+    The cap is the same `image.VLM_MAX_DIM` the still-image path enforces:
+    beyond it the vision encoder OOMs (a 4K frame fails every time with
+    `cudaMalloc failed: out of memory`), and even frames that fit are markedly
+    slower to encode. Scaling here is free — ffmpeg has already decoded the
+    frame — and keeps oversized JPEGs off disk entirely. `min(...,iw)` never
+    upscales; -2 keeps the aspect ratio on an even height.
+    """
     try:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-v", "error", "-ss", f"{timestamp:.2f}",
-                "-i", str(path), "-frames:v", "1", "-q:v", "3", str(out_path),
+                "-i", str(path), "-frames:v", "1",
+                "-vf", f"scale='min({image_ex.VLM_MAX_DIM},iw)':-2",
+                "-q:v", "3", str(out_path),
             ],
             capture_output=True, timeout=120, check=True,
         )
