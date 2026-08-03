@@ -679,9 +679,13 @@ class Tier2Worker:
                 f"[{format_ts(s['start'])} - {format_ts(s['end'])}] {cap}"
             )
             scene_chunks.append({"text": cap, "ts_start": s["start"], "ts_end": s["end"]})
+        if result.get("frames_undecodable"):
+            log.warning("no decodable video frames in %s — captions will be empty "
+                        "(audio, if any, is unaffected)", path)
         cid = self.index.store_content(
             file_id, "video_scenes", self._version("video_scenes"), "\n".join(scene_lines),
             meta={"scenes": result["scenes"]},
+            degraded=bool(result.get("frames_undecodable")),
         )
         self.index.store_chunks(file_id, cid, "video_scenes",
                                 self.embedder.embed_chunks(scene_chunks))

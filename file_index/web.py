@@ -707,8 +707,9 @@ function renderStage(c) {
     video_transcript: "Video transcript", video_summary: "Video summary" };
   const body = (c.body || "").slice(0, 20000);
   const node = ["video_summary", "audio_summary"].includes(c.stage)
-    ? el("p", "", body) : el("pre", "", body);
-  return section(titles[c.stage] || c.stage, node);
+    ? el("p", "", body)
+    : el("pre", "", body || (c.degraded ? "(nothing could be extracted)" : ""));
+  return section((titles[c.stage] || c.stage) + (c.degraded ? " (degraded)" : ""), node);
 }
 
 function closeModal() {

@@ -158,6 +158,11 @@ def _hamming(a: int, b: int) -> int:
 # almost-identical frames across scene cuts).
 DHASH_NEAR_DUPLICATE = 6
 
+# Consecutive failed frame extractions, with none yet decoded, after which a
+# video's visual stream is treated as unreadable and the remaining scenes are
+# skipped. Audio is unaffected — it is demuxed separately.
+FRAME_DECODE_GIVE_UP = 4
+
 
 def extract_audio_track(path: Path, out_path: Path) -> Path | None:
     """Extract mono 16 kHz wav for Whisper. None if the video has no audio."""
@@ -225,6 +230,7 @@ def process_video(
     scene_results = []
     skipped_dups = 0
     caption_attempts = caption_failures = 0
+    frames_decoded = frames_failed = 0
     seen_hashes: list[int] = []
     with tempfile.TemporaryDirectory(prefix="file-index-video-") as tmp:
         tmpdir = Path(tmp)
@@ -233,43 +239,66 @@ def process_video(
                 pool.submit(extract_audio_track, path, tmpdir / "audio.wav")
                 if transcribe else None
             )
-            frame_futures = []
-            for i, (start, end) in enumerate(scenes):
-                span = end - start
-                n = max(1, min(frames_per_scene, 2))
-                offsets = [start + span * 0.5] if n == 1 or span < 2 else [
-                    start + span * 0.25, start + span * 0.75
-                ]
-                frame_futures.append([
-                    pool.submit(extract_frame, path, ts, tmpdir / f"s{i}_f{j}.jpg")
-                    for j, ts in enumerate(offsets)
-                ])
             caption_prompt = CAPTION_PROMPT + (
                 CAPTION_CONTEXT_SUFFIX.format(context=context) if context else ""
             )
-            for i, (start, end) in enumerate(scenes):
-                captions = []
-                for fut in frame_futures[i]:
-                    frame = fut.result()
-                    if not frame:
-                        continue
-                    if dedup_frames:
-                        h = frame_dhash(frame)
-                        if h is not None:
-                            if any(_hamming(h, s) <= DHASH_NEAR_DUPLICATE for s in seen_hashes):
-                                skipped_dups += 1
-                                continue
-                            seen_hashes.append(h)
-                    caption_attempts += 1
-                    try:
-                        cap = client.generate(vision_model, caption_prompt, images=[frame])
-                        captions.append(cap.strip())
-                    except Exception as e:  # noqa: BLE001 — keep other scenes going
-                        caption_failures += 1
-                        log.warning("caption failed scene %d of %s: %s", i, path, e)
-                scene_results.append(
-                    {"start": round(start, 2), "end": round(end, 2), "captions": captions}
-                )
+
+            def _offsets(start: float, end: float) -> list[float]:
+                span = end - start
+                n = max(1, min(frames_per_scene, 2))
+                if n == 1 or span < 2:
+                    return [start + span * 0.5]
+                return [start + span * 0.25, start + span * 0.75]
+
+            # Frames are extracted a chunk of scenes ahead of the VLM rather
+            # than all at once: the pool still stays comfortably ahead (the
+            # captioner is serialized on one GPU), but a stream ffmpeg cannot
+            # decode is abandoned after one chunk instead of paying an
+            # extraction for every scene — one real file logged 1508 of them.
+            chunk_size = max(4, frame_workers)
+            for base in range(0, len(scenes), chunk_size):
+                chunk = scenes[base : base + chunk_size]
+                chunk_futures = [
+                    [
+                        pool.submit(extract_frame, path, ts, tmpdir / f"s{base + i}_f{j}.jpg")
+                        for j, ts in enumerate(_offsets(start, end))
+                    ]
+                    for i, (start, end) in enumerate(chunk)
+                ]
+                for i, (start, end) in enumerate(chunk):
+                    captions = []
+                    for fut in chunk_futures[i]:
+                        frame = fut.result()
+                        if not frame:
+                            frames_failed += 1
+                            continue
+                        frames_decoded += 1
+                        if dedup_frames:
+                            h = frame_dhash(frame)
+                            if h is not None:
+                                if any(_hamming(h, s) <= DHASH_NEAR_DUPLICATE for s in seen_hashes):
+                                    skipped_dups += 1
+                                    continue
+                                seen_hashes.append(h)
+                        caption_attempts += 1
+                        try:
+                            cap = client.generate(vision_model, caption_prompt, images=[frame])
+                            captions.append(cap.strip())
+                        except Exception as e:  # noqa: BLE001 — keep other scenes going
+                            caption_failures += 1
+                            log.warning("caption failed scene %d of %s: %s",
+                                        base + i, path, e)
+                    scene_results.append(
+                        {"start": round(start, 2), "end": round(end, 2), "captions": captions}
+                    )
+                if not frames_decoded and frames_failed >= FRAME_DECODE_GIVE_UP:
+                    remaining = len(scenes) - len(scene_results)
+                    if remaining:
+                        log.warning(
+                            "%s: no decodable frames after %d attempts — skipping the "
+                            "remaining %d scene(s)", path.name, frames_failed, remaining,
+                        )
+                    break
             wav = wav_future.result() if wav_future else None
         if skipped_dups:
             log.info("%s: skipped %d near-duplicate frames", path.name, skipped_dups)
@@ -319,6 +348,11 @@ def process_video(
         "summary": summary,
         "captions_text": captions_text,
         "transcript_text": transcript_text,
+        # True when ffmpeg could not decode a single frame: the file completes
+        # (its audio may still be fine) but its visual coverage is empty, and
+        # the caller marks the stored scenes degraded rather than passing them
+        # off as a real result.
+        "frames_undecodable": frames_failed > 0 and frames_decoded == 0,
     }
 
 
