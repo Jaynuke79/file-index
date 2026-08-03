@@ -429,7 +429,14 @@ def browse(
     ),
 ) -> None:
     """Serve a local web gallery of indexed files and their captions."""
-    cfg, _index = _load()
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    _setup_logging(cfg)
+    # Checked before Index() is ever constructed — creating an Index would
+    # itself create an empty db, making this check impossible to hit.
     if not cfg.db_path.exists():
         console.print("[red]No index found — run `file-index scan` first.[/red]")
         raise typer.Exit(1)

@@ -67,7 +67,9 @@ class Store:
             )
         }
         captioned = self.db.execute(
-            "SELECT count(DISTINCT file_id) FROM content WHERE stage IN (?,?,?,?)",
+            "SELECT count(DISTINCT c.file_id) FROM content c "
+            "JOIN files f ON f.id=c.file_id AND f.deleted=0 "
+            "WHERE c.stage IN (?,?,?,?)",
             CAPTION_STAGES[:4],
         ).fetchone()[0]
         return {"kinds": kinds, "captioned": captioned, "total": sum(kinds.values())}
@@ -375,6 +377,9 @@ class Handler(BaseHTTPRequestHandler):
                 start = int(m.group(1))
                 if m.group(2):
                     end = min(int(m.group(2)), size - 1)
+                    if start > int(m.group(2)):
+                        # malformed (e.g. bytes=500-100): ignore per RFC 7233
+                        status, start, end = 200, 0, size - 1
             else:  # suffix range: last N bytes
                 start = max(0, size - int(m.group(2)))
             if start >= size:
