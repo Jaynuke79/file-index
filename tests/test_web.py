@@ -125,7 +125,7 @@ def _get(url, headers=None):
 def test_http_index_and_api(server):
     base, ids = server
     status, headers, body = _get(base + "/")
-    assert status == 200 and b"file-index browser" in body
+    assert status == 200 and b"<title>file-index</title>" in body
 
     status, _, body = _get(base + "/api/files?kind=image")
     assert status == 200
