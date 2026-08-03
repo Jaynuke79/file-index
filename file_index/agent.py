@@ -19,7 +19,8 @@ from pathlib import Path
 from .config import Config
 from .index import Index
 from .ollama_client import OllamaClient
-from .search import format_ts, hybrid_search
+from .search import hybrid_search
+from .util import format_ts, strip_think
 
 log = logging.getLogger("file_index.agent")
 
@@ -181,9 +182,6 @@ user's files using the provided tools. Everything runs locally; you may freely r
 indexed content. Cite file paths in your answers. If a search returns nothing useful,
 try rephrased queries before giving up. Be concise and concrete."""
 
-
-def strip_think(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 def ask(config: Config, index: Index, question: str, on_tool=None) -> str:

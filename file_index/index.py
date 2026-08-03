@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .util import fts_escape
+
 # Queue statuses
 PENDING_METADATA = "pending_metadata"
 PENDING_DEEP = "pending_deep"
@@ -461,7 +463,7 @@ class Index:
                 "FROM content_fts JOIN content c ON c.id = content_fts.rowid "
                 "JOIN files f ON f.id = c.file_id "
                 "WHERE content_fts MATCH ? AND f.deleted=0 ORDER BY rank LIMIT ?",
-                (_fts_escape(query), limit),
+                (fts_escape(query), limit),
             ).fetchall()
         except sqlite3.OperationalError:
             return []
@@ -559,11 +561,6 @@ class Index:
         self.db.commit()
         self.db.close()
 
-
-def _fts_escape(query: str) -> str:
-    """Quote each term so user queries can't break FTS5 syntax."""
-    terms = [t.replace('"', '""') for t in query.split()]
-    return " ".join(f'"{t}"' for t in terms if t)
 
 
 def merge_hits(
