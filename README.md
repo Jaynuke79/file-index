@@ -158,6 +158,10 @@ anyone who can reach the address — `browse` prints a warning when you do it.
   before/after paths.
 - Permission errors, broken symlinks, and files disappearing mid-processing are
   marked failed (max 3 retries) and never abort a run.
+- Partial results are labelled rather than passed off as complete. If the vision
+  model is unreachable the file is retried; if its video stream cannot be decoded
+  at all, extraction stops early and the stored scenes are marked `degraded`
+  (visible in `browse`) while the audio transcript and summary still land.
 
 ## Architecture
 
@@ -191,13 +195,16 @@ agent CLI ← search/organize tools ← index
 .venv/bin/pytest
 ```
 
-127 tests, no GPU or network required — models, Whisper, and ffmpeg are mocked.
+139 tests, no GPU or network required — models and Whisper are mocked, and the
+handful of tests that need real ffmpeg generate their own clips and skip when it
+is absent.
 
 - **Indexing**: crawler incremental logic (unchanged/modified/moved/deleted,
   excludes, symlinks), chunking, queue kill/resume, tier-2 priority ordering,
   duplicate reuse, and sqlite-vec cleanup on re-extraction.
 - **Deep pass**: VLM JSON validation and degradation, caption-failure retry,
-  scene sampling and frame dedup, CPU/GPU overlap, background transcription,
+  frame downscaling to the VLM input limit, undecodable-stream handling, scene
+  sampling and tunable frame dedup, CPU/GPU overlap, background transcription,
   deferred summaries for video and audio, Whisper cache thread-safety, model
   unloading.
 - **Safety**: the root whitelist across every agent tool (including `..`
