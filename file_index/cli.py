@@ -338,15 +338,31 @@ def _assert_inside(cfg: Config, p: Path) -> None:
 
 
 def _append_audit_file(cfg: Config, index: Index) -> None:
-    """Mirror the DB audit log to a plain-text file for easy inspection."""
+    """Mirror the DB audit log to a plain-text file for easy inspection.
+
+    The id of the last mirrored row is kept in the meta table so repeated
+    runs append each entry exactly once."""
     import time as _time
 
+    row = index.db.execute(
+        "SELECT value FROM meta WHERE key='audit_mirrored_id'"
+    ).fetchone()
+    last_id = int(row["value"]) if row else 0
+    rows = index.db.execute(
+        "SELECT * FROM audit_log WHERE id>? ORDER BY id", (last_id,)
+    ).fetchall()
+    if not rows:
+        return
     with open(cfg.audit_log_path, "a") as f:
-        for row in index.db.execute(
-            "SELECT * FROM audit_log ORDER BY id DESC LIMIT 200"
-        ).fetchall()[::-1]:
+        for row in rows:
             ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(row["ts"]))
             f.write(f"{ts} {row['op']} {row['before_path'] or '-'} -> {row['after_path'] or '-'} ({row['detail']})\n")
+    index.db.execute(
+        "INSERT INTO meta(key, value) VALUES('audit_mirrored_id', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(rows[-1]["id"]),),
+    )
+    index.commit()
 
 
 @app.command()
