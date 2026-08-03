@@ -37,6 +37,7 @@ file-index organize ~/Downloads            # prints a plan, changes nothing
 file-index organize ~/Downloads --apply    # applies moves/renames after confirmation
 file-index browse            # local web gallery: files + captions, search, filters
 file-index exclude PATH      # remove files from the index + future scans (disk untouched)
+file-index purge             # erase indexed data of removed/excluded files for good
 file-index status            # queue stats, per-type counts, failures
 file-index watch             # incremental watcher (or install the systemd unit)
 ```
@@ -107,6 +108,12 @@ running while `scan`/`deep` work.
 - v1 performs **no destructive operations**. `organize` is read-only by default;
   `--apply` performs moves/renames only, after an interactive confirmation.
   Deletion is not implemented anywhere (proposals may only *flag* candidates).
+- Removal from the index is soft by default (`exclude` and vanished files keep
+  their extractions, so re-adding is free). `purge` makes it permanent —
+  erasing bodies, captions, transcripts, embeddings and cached thumbnails of
+  removed files — for when the point of excluding was privacy, not tidiness.
+  Use `--older-than-days N` to keep a grace period. Files on disk are never
+  touched by either.
 - Every applied write is recorded in the audit log (DB + `audit.log`) with
   before/after paths.
 - Permission errors, broken symlinks, and files disappearing mid-processing are

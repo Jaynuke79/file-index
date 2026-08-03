@@ -316,6 +316,61 @@ class Index:
             n += 1
         return n
 
+    def purge_deleted(self, older_than: float | None = None) -> dict:
+        """Hard-delete soft-deleted files and everything extracted from them.
+
+        Soft deletion (`deleted=1`, set by a vanished file or by `exclude`)
+        keeps every body, caption and transcript in the database forever. This
+        reclaims that space and makes `exclude` a real privacy control.
+
+        `older_than` is a unix timestamp: only files whose `updated_at` is
+        older are purged, so a just-excluded directory can be given a grace
+        period. Returns {files, content, chunks}.
+        """
+        where = "deleted=1" + (" AND updated_at < ?" if older_than else "")
+        params: tuple = (older_than,) if older_than else ()
+        file_ids = [
+            r["id"] for r in self.db.execute(f"SELECT id FROM files WHERE {where}", params)
+        ]
+        if not file_ids:
+            return {"files": 0, "content": 0, "chunks": 0}
+        marks = ",".join("?" * len(file_ids))
+        content_ids = [
+            r["id"] for r in self.db.execute(
+                f"SELECT id FROM content WHERE file_id IN ({marks})", file_ids
+            )
+        ]
+        chunk_ids = [
+            r["id"] for r in self.db.execute(
+                f"SELECT id FROM chunks WHERE file_id IN ({marks})", file_ids
+            )
+        ]
+        # FTS and vec are shadow tables, not foreign keys: the files cascade
+        # will not touch them, so clear them explicitly first.
+        for cid in content_ids:
+            self.db.execute("DELETE FROM content_fts WHERE rowid=?", (cid,))
+        if self._vec_table:
+            for chid in chunk_ids:
+                self.db.execute("DELETE FROM chunk_vec WHERE rowid=?", (chid,))
+        # content/chunks/queue cascade from files (ON DELETE CASCADE).
+        self.db.execute(f"DELETE FROM files WHERE id IN ({marks})", file_ids)
+        self.commit()
+        return {
+            "files": len(file_ids),
+            "content": len(content_ids),
+            "chunks": len(chunk_ids),
+        }
+
+    def live_thumb_keys(self) -> set[str]:
+        """`<id>-<mtime>` keys for every live file — anything else in the
+        thumbnail cache is stale (deleted file, or an older version of one)."""
+        return {
+            f"{r['id']}-{int(r['mtime'])}"
+            for r in self.db.execute(
+                "SELECT id, mtime FROM files WHERE deleted=0 AND mtime IS NOT NULL"
+            )
+        }
+
     def get_content(self, file_id: int, stage: str | None = None) -> list[sqlite3.Row]:
         if stage:
             return self.db.execute(
