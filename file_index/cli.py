@@ -470,7 +470,7 @@ def purge(
     Files deleted from disk or removed with `exclude` are only soft-deleted:
     their extracted text, captions and transcripts stay in the database (so
     the removal stays reversible). This erases that data for good and prunes
-    the thumbnail cache. Files on disk are never touched.
+    the thumbnail and preview caches. Files on disk are never touched.
     """
     import time as _time
 
@@ -493,16 +493,19 @@ def purge(
         return
 
     stats = index.purge_deleted(older_than=cutoff)
-    from .web import prune_thumbs
+    from .web import prune_previews, prune_thumbs
 
-    thumbs = prune_thumbs(cfg.data_dir / "thumbs", index.live_thumb_keys())
+    live_keys = index.live_thumb_keys()
+    thumbs = prune_thumbs(cfg.data_dir / "thumbs", live_keys)
+    previews = prune_previews(cfg.data_dir / "previews", live_keys)
     index.audit("purge", None, None,
                 f"files={stats['files']} content={stats['content']} "
-                f"chunks={stats['chunks']} thumbs={thumbs}")
+                f"chunks={stats['chunks']} thumbs={thumbs} previews={previews}")
     console.print(
         f"purged [green]{stats['files']} files[/green] "
         f"({stats['content']} extractions, {stats['chunks']} chunks, "
-        f"{thumbs} cached thumbnails). Run [bold]file-index status[/bold] to see the new size."
+        f"{thumbs} cached thumbnails, {previews} cached previews). "
+        "Run [bold]file-index status[/bold] to see the new size."
     )
 
 

@@ -28,6 +28,12 @@ log = logging.getLogger("file_index.web")
 THUMB_SIZE = 512
 PAGE_LIMIT_MAX = 200
 
+# Extensions browsers won't render/play natively even though the index (and
+# thumbnails) handle them fine. Transcoded to a browser-native format on
+# first request and cached in `previews/`, mirroring the `thumbs/` cache.
+PREVIEW_IMAGE_EXTS = {".heic"}
+PREVIEW_VIDEO_EXTS = {".mov"}
+
 # Stages that hold a human-readable caption, in preference order. The first
 # four are "real" captions (used for the captioned-only filter/count);
 # video_scenes covers videos whose deferred summary hasn't been generated yet.
@@ -245,6 +251,23 @@ def prune_thumbs(thumb_dir: Path, live_keys: set[str]) -> int:
     return removed
 
 
+def prune_previews(preview_dir: Path, live_keys: set[str]) -> int:
+    """Delete cached previews (transcoded HEIC/MOV) that no live file claims.
+    Same `<file_id>-<mtime>` keying as `prune_thumbs`, across both the .jpg
+    and .mp4 outputs a preview can produce. Returns the number removed."""
+    if not preview_dir.is_dir():
+        return 0
+    removed = 0
+    for p in (*preview_dir.glob("*.jpg"), *preview_dir.glob("*.mp4")):
+        if p.stem not in live_keys:
+            try:
+                p.unlink()
+                removed += 1
+            except OSError as e:  # noqa: PERF203 — best-effort cache cleanup
+                log.debug("could not remove stale preview %s: %s", p, e)
+    return removed
+
+
 def _make_thumb(src: Path, kind: str, out: Path) -> Path | None:
     """Generate a JPEG thumbnail for an image/video/pdf. None if unsupported."""
     try:
@@ -259,27 +282,24 @@ def _make_thumb(src: Path, kind: str, out: Path) -> Path | None:
     return None
 
 
-def _save_jpeg(img, out: Path) -> Path:
-    img.thumbnail((THUMB_SIZE, THUMB_SIZE))
+def _save_jpeg(img, out: Path, max_size: int | None = None, quality: int = 80) -> Path:
+    if max_size:
+        img.thumbnail((max_size, max_size))
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     tmp = out.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-    img.save(tmp, "JPEG", quality=80)
+    img.save(tmp, "JPEG", quality=quality)
     os.replace(tmp, out)
     return out
 
 
 def _thumb_image(src: Path, out: Path) -> Path | None:
+    import pillow_heif
     from PIL import Image
 
-    try:
-        import pillow_heif
-
-        pillow_heif.register_heif_opener()
-    except ImportError:
-        pass
+    pillow_heif.register_heif_opener()
     with Image.open(src) as img:
-        return _save_jpeg(img, out)
+        return _save_jpeg(img, out, THUMB_SIZE)
 
 
 def _thumb_video(src: Path, out: Path) -> Path | None:
@@ -296,7 +316,7 @@ def _thumb_video(src: Path, out: Path) -> Path | None:
         if frame is None:
             return None
         with Image.open(frame) as img:
-            return _save_jpeg(img, out)
+            return _save_jpeg(img, out, THUMB_SIZE)
 
 
 def _thumb_pdf(src: Path, out: Path) -> Path | None:
@@ -310,7 +330,56 @@ def _thumb_pdf(src: Path, out: Path) -> Path | None:
             return None
         pix = doc[0].get_pixmap(dpi=72)
         with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
-            return _save_jpeg(img, out)
+            return _save_jpeg(img, out, THUMB_SIZE)
+
+
+# ---------- previews (full-size, browser-native) ----------
+
+
+def _make_preview(src: Path, out: Path) -> Path | None:
+    """Convert a file the browser can't render/play natively into something
+    it can. Best-effort like `_make_thumb`; None on failure."""
+    ext = src.suffix.lower()
+    try:
+        if ext in PREVIEW_IMAGE_EXTS:
+            return _preview_image(src, out)
+        if ext in PREVIEW_VIDEO_EXTS:
+            return _preview_video(src, out)
+    except Exception as e:  # noqa: BLE001 — previews are best-effort
+        log.debug("preview failed for %s: %s", src, e)
+    return None
+
+
+def _preview_image(src: Path, out: Path) -> Path | None:
+    """Full-resolution JPEG for image formats browsers can't display inline
+    (HEIC — the default capture format on modern iPhones)."""
+    import pillow_heif
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+    with Image.open(src) as img:
+        return _save_jpeg(img, out, quality=92)
+
+
+def _preview_video(src: Path, out: Path) -> Path | None:
+    """H.264/AAC MP4 for video that browsers won't play in <video> — .mov
+    from phones is commonly HEVC, which Chrome/Firefox can't decode."""
+    import subprocess
+
+    tmp = out.with_name(f"{out.name}.{os.getpid()}.{threading.get_ident()}.tmp.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "aac", "-movflags", "+faststart", str(tmp)],
+            capture_output=True, timeout=600, check=True,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        log.warning("preview transcode failed for %s: %s", src, e)
+        tmp.unlink(missing_ok=True)
+        return None
+    os.replace(tmp, out)
+    return out
 
 
 # ---------- HTTP ----------
@@ -330,6 +399,7 @@ def is_loopback(host: str) -> bool:
 class Handler(BaseHTTPRequestHandler):
     store: Store
     thumb_dir: Path
+    preview_dir: Path
     # When set, requests whose Host header is not listed get 403. This is the
     # standard DNS-rebinding defense for localhost servers: a malicious site
     # rebinding its hostname to 127.0.0.1 sends its own domain as Host and can
@@ -547,8 +617,16 @@ class Handler(BaseHTTPRequestHandler):
         src, _kind = info
         if not src.is_file():
             return self._error(404, "file missing on disk")
-        size = src.stat().st_size
+        ext = src.suffix.lower()
         ctype = mimetypes.guess_type(src.name)[0] or "application/octet-stream"
+        if ext in PREVIEW_IMAGE_EXTS or ext in PREVIEW_VIDEO_EXTS:
+            preview_ext = ".jpg" if ext in PREVIEW_IMAGE_EXTS else ".mp4"
+            out = self.preview_dir / f"{file_id}-{int(src.stat().st_mtime)}{preview_ext}"
+            if not out.exists() and _make_preview(src, out) is None:
+                return self._error(404, "preview unavailable for this file")
+            src = out
+            ctype = "image/jpeg" if preview_ext == ".jpg" else "video/mp4"
+        size = src.stat().st_size
         start, end = 0, size - 1
         status = 200
         m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
@@ -595,6 +673,8 @@ def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765) -> Threa
 
     thumb_dir = cfg.data_dir / "thumbs"
     thumb_dir.mkdir(parents=True, exist_ok=True)
+    preview_dir = cfg.data_dir / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
     # The control panel edits config and launches jobs, so it is enabled only
     # on a loopback bind. Exposing it on a LAN address would hand anyone who
     # can reach the port the ability to index arbitrary directories.
@@ -605,6 +685,7 @@ def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765) -> Threa
         {
             "store": Store(cfg.db_path),
             "thumb_dir": thumb_dir,
+            "preview_dir": preview_dir,
             "config": cfg,
             "jobs": JobRunner(),
             "csrf_token": secrets.token_urlsafe(32),
