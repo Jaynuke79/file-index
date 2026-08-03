@@ -93,7 +93,23 @@ VLM work per video is bounded: scene-heavy videos are sampled down to
 `deep.video_max_scenes` scenes (default 40, evenly spread; 0 = no cap), and
 frames that are near-duplicates of already-captioned ones (perceptual hash —
 common in gameplay/screen recordings) are skipped
-(`deep.video_dedup_frames`).
+(`deep.video_dedup_frames`). Every frame is downscaled to the vision model's
+input limit during extraction; beyond it the encoder OOMs on a 32 GB GPU.
+
+### Tuning captioning throughput
+
+Captioning dominates `deep` — roughly `scenes x frames_per_scene x ~9 s` per
+video — so these knobs trade visual detail for wall-clock. Measured over 3532
+already-captioned videos (32747 captions, 9.3/video):
+
+| Setting | Effect |
+|---|---|
+| `deep.video_frames_per_scene: 1` | 6.2 captions/video — **33% less VLM work**. Not 50%, because dedup already drops many second frames and scenes under 2 s take one frame anyway. |
+| `deep.video_dedup_distance` (default 6) | Perceptual-hash distance under which a frame counts as a near-duplicate. 8–10 skips noticeably more on screen recordings and gameplay; 0 skips only identical frames. |
+| `deep.video_max_scenes` (default 40) | Caps the tail. One video in the sample detected 754 scenes. |
+
+Lowering detail is safe to revisit later: bump the stage version or change the
+model and `file-index reindex` re-captions only the affected files.
 
 When a video sits in a folder with already-summarized siblings, the captioner
 and summarizer get those summaries as background (`deep.neighbor_context`,
