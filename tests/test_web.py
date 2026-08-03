@@ -1,12 +1,18 @@
 """Tests for the browse web UI: Store queries and the HTTP endpoints."""
 
 import json
+import shutil
+import subprocess
 import threading
 import urllib.request
 
 import pytest
 
 from file_index.web import Store, _fts_escape, make_server
+
+pytestmark_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="ffmpeg not installed"
+)
 
 
 @pytest.fixture
@@ -125,7 +131,7 @@ def _get(url, headers=None):
 def test_http_index_and_api(server):
     base, ids = server
     status, headers, body = _get(base + "/")
-    assert status == 200 and b"file-index browser" in body
+    assert status == 200 and b"<title>file-index</title>" in body
 
     status, _, body = _get(base + "/api/files?kind=image")
     assert status == 200
@@ -173,6 +179,83 @@ def test_http_media_and_ranges(server):
     # deleted files are never served
     status, _, _ = _get(f"{base}/media/{ids['gone']}")
     assert status == 404
+
+
+@pytest.fixture
+def previews(tmp_env):
+    """Index with a real HEIC photo and a real .mov clip on disk — the two
+    formats browsers can't render/play natively, needing server-side preview
+    transcoding (see PREVIEW_IMAGE_EXTS / PREVIEW_VIDEO_EXTS in web.py)."""
+    cfg, index, root = tmp_env
+
+    import pillow_heif
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+    heic_path = root / "photo.heic"
+    Image.new("RGB", (64, 48), (40, 160, 90)).save(heic_path, format="HEIF", quality=80)
+    fid_heic = index.upsert_file(
+        str(heic_path), "h1", heic_path.stat().st_size, 100.0, "image/heic", "image"
+    )
+
+    mov_path = root / "clip.mov"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+         "-i", "testsrc=size=64x48:rate=10:duration=1",
+         "-pix_fmt", "yuv420p", str(mov_path)],
+        check=True, capture_output=True, timeout=120,
+    )
+    fid_mov = index.upsert_file(
+        str(mov_path), "h2", mov_path.stat().st_size, 200.0, "video/quicktime", "video"
+    )
+
+    index.commit()
+    srv = make_server(cfg, host="127.0.0.1", port=0)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}", {"heic": fid_heic, "mov": fid_mov}, cfg
+    srv.shutdown()
+    srv.server_close()
+
+
+def test_http_media_transcodes_heic_to_jpeg(previews):
+    base, ids, cfg = previews
+    status, headers, body = _get(f"{base}/media/{ids['heic']}")
+    assert status == 200
+    assert headers["Content-Type"] == "image/jpeg"
+    assert body[:2] == b"\xff\xd8"  # JPEG magic
+    # cached under previews/, keyed like thumbs/
+    assert list((cfg.data_dir / "previews").glob("*.jpg"))
+
+
+@pytestmark_ffmpeg
+def test_http_media_transcodes_mov_to_mp4(previews):
+    base, ids, cfg = previews
+    status, headers, body = _get(f"{base}/media/{ids['mov']}")
+    assert status == 200
+    assert headers["Content-Type"] == "video/mp4"
+    assert body[4:8] in (b"ftyp",)  # MP4 container signature
+    cached = list((cfg.data_dir / "previews").glob("*.mp4"))
+    assert cached
+    # Range requests work against the cached mp4, same as any other media
+    status, headers, _ = _get(f"{base}/media/{ids['mov']}", {"Range": "bytes=0-9"})
+    assert status == 206
+    assert headers["Content-Range"] == f"bytes 0-9/{cached[0].stat().st_size}"
+
+
+def test_prune_previews_removes_only_stale_entries(tmp_path):
+    from file_index.web import prune_previews
+
+    preview_dir = tmp_path / "previews"
+    preview_dir.mkdir()
+    (preview_dir / "1-100.jpg").write_bytes(b"x")
+    (preview_dir / "2-200.mp4").write_bytes(b"x")
+    (preview_dir / "3-300.jpg").write_bytes(b"x")
+
+    removed = prune_previews(preview_dir, live_keys={"1-100", "3-300"})
+    assert removed == 1
+    remaining = {p.name for p in preview_dir.iterdir()}
+    assert remaining == {"1-100.jpg", "3-300.jpg"}
 
 
 def test_browse_without_index_errors_and_creates_no_db(tmp_path, monkeypatch):

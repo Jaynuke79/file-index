@@ -20,12 +20,19 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .config import Config
+from .ui import WEB_UI
 from .util import fts_escape as _fts_escape
 
 log = logging.getLogger("file_index.web")
 
 THUMB_SIZE = 512
 PAGE_LIMIT_MAX = 200
+
+# Extensions browsers won't render/play natively even though the index (and
+# thumbnails) handle them fine. Transcoded to a browser-native format on
+# first request and cached in `previews/`, mirroring the `thumbs/` cache.
+PREVIEW_IMAGE_EXTS = {".heic"}
+PREVIEW_VIDEO_EXTS = {".mov"}
 
 # Stages that hold a human-readable caption, in preference order. The first
 # four are "real" captions (used for the captioned-only filter/count);
@@ -179,6 +186,42 @@ class Store:
         out["error"] = err["error"] if err else None
         return out
 
+    def status(self) -> dict:
+        """The `status` command as data: queue depth, per-kind counts, failures."""
+        queue: dict = {"tier1": {}, "tier2": {}}
+        for r in self.db.execute(
+            "SELECT tier, status, COUNT(*) n FROM queue GROUP BY tier, status"
+        ):
+            queue[f"tier{r['tier']}"][r["status"]] = r["n"]
+        kinds = [
+            {"kind": r["kind"] or "?", "n": r["n"], "size": r["s"] or 0}
+            for r in self.db.execute(
+                "SELECT kind, COUNT(*) n, SUM(size) s FROM files WHERE deleted=0 "
+                "GROUP BY kind ORDER BY n DESC"
+            )
+        ]
+        failures = [
+            {"tier": r["tier"], "path": r["path"], "error": (r["error"] or "")[:300],
+             "retries": r["retries"]}
+            for r in self.db.execute(
+                "SELECT q.tier, q.error, q.retries, f.path FROM queue q "
+                "JOIN files f ON f.id=q.file_id WHERE q.status='failed' "
+                "ORDER BY q.updated_at DESC LIMIT 25"
+            )
+        ]
+        totals = self.db.execute(
+            "SELECT (SELECT COUNT(*) FROM files WHERE deleted=0) files, "
+            "(SELECT COUNT(*) FROM chunks) chunks, "
+            "(SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL) embedded"
+        ).fetchone()
+        return {
+            "queue": queue,
+            "kinds": kinds,
+            "failures": failures,
+            "totals": dict(totals),
+            "db_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
+        }
+
     def file_path(self, file_id: int) -> tuple[Path, str] | None:
         row = self.db.execute(
             "SELECT path, kind, mime FROM files WHERE id=? AND deleted=0", (file_id,)
@@ -208,6 +251,23 @@ def prune_thumbs(thumb_dir: Path, live_keys: set[str]) -> int:
     return removed
 
 
+def prune_previews(preview_dir: Path, live_keys: set[str]) -> int:
+    """Delete cached previews (transcoded HEIC/MOV) that no live file claims.
+    Same `<file_id>-<mtime>` keying as `prune_thumbs`, across both the .jpg
+    and .mp4 outputs a preview can produce. Returns the number removed."""
+    if not preview_dir.is_dir():
+        return 0
+    removed = 0
+    for p in (*preview_dir.glob("*.jpg"), *preview_dir.glob("*.mp4")):
+        if p.stem not in live_keys:
+            try:
+                p.unlink()
+                removed += 1
+            except OSError as e:  # noqa: PERF203 — best-effort cache cleanup
+                log.debug("could not remove stale preview %s: %s", p, e)
+    return removed
+
+
 def _make_thumb(src: Path, kind: str, out: Path) -> Path | None:
     """Generate a JPEG thumbnail for an image/video/pdf. None if unsupported."""
     try:
@@ -222,27 +282,24 @@ def _make_thumb(src: Path, kind: str, out: Path) -> Path | None:
     return None
 
 
-def _save_jpeg(img, out: Path) -> Path:
-    img.thumbnail((THUMB_SIZE, THUMB_SIZE))
+def _save_jpeg(img, out: Path, max_size: int | None = None, quality: int = 80) -> Path:
+    if max_size:
+        img.thumbnail((max_size, max_size))
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     tmp = out.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-    img.save(tmp, "JPEG", quality=80)
+    img.save(tmp, "JPEG", quality=quality)
     os.replace(tmp, out)
     return out
 
 
 def _thumb_image(src: Path, out: Path) -> Path | None:
+    import pillow_heif
     from PIL import Image
 
-    try:
-        import pillow_heif
-
-        pillow_heif.register_heif_opener()
-    except ImportError:
-        pass
+    pillow_heif.register_heif_opener()
     with Image.open(src) as img:
-        return _save_jpeg(img, out)
+        return _save_jpeg(img, out, THUMB_SIZE)
 
 
 def _thumb_video(src: Path, out: Path) -> Path | None:
@@ -259,7 +316,7 @@ def _thumb_video(src: Path, out: Path) -> Path | None:
         if frame is None:
             return None
         with Image.open(frame) as img:
-            return _save_jpeg(img, out)
+            return _save_jpeg(img, out, THUMB_SIZE)
 
 
 def _thumb_pdf(src: Path, out: Path) -> Path | None:
@@ -273,7 +330,56 @@ def _thumb_pdf(src: Path, out: Path) -> Path | None:
             return None
         pix = doc[0].get_pixmap(dpi=72)
         with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
-            return _save_jpeg(img, out)
+            return _save_jpeg(img, out, THUMB_SIZE)
+
+
+# ---------- previews (full-size, browser-native) ----------
+
+
+def _make_preview(src: Path, out: Path) -> Path | None:
+    """Convert a file the browser can't render/play natively into something
+    it can. Best-effort like `_make_thumb`; None on failure."""
+    ext = src.suffix.lower()
+    try:
+        if ext in PREVIEW_IMAGE_EXTS:
+            return _preview_image(src, out)
+        if ext in PREVIEW_VIDEO_EXTS:
+            return _preview_video(src, out)
+    except Exception as e:  # noqa: BLE001 — previews are best-effort
+        log.debug("preview failed for %s: %s", src, e)
+    return None
+
+
+def _preview_image(src: Path, out: Path) -> Path | None:
+    """Full-resolution JPEG for image formats browsers can't display inline
+    (HEIC — the default capture format on modern iPhones)."""
+    import pillow_heif
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+    with Image.open(src) as img:
+        return _save_jpeg(img, out, quality=92)
+
+
+def _preview_video(src: Path, out: Path) -> Path | None:
+    """H.264/AAC MP4 for video that browsers won't play in <video> — .mov
+    from phones is commonly HEVC, which Chrome/Firefox can't decode."""
+    import subprocess
+
+    tmp = out.with_name(f"{out.name}.{os.getpid()}.{threading.get_ident()}.tmp.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "aac", "-movflags", "+faststart", str(tmp)],
+            capture_output=True, timeout=600, check=True,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        log.warning("preview transcode failed for %s: %s", src, e)
+        tmp.unlink(missing_ok=True)
+        return None
+    os.replace(tmp, out)
+    return out
 
 
 # ---------- HTTP ----------
@@ -293,12 +399,21 @@ def is_loopback(host: str) -> bool:
 class Handler(BaseHTTPRequestHandler):
     store: Store
     thumb_dir: Path
+    preview_dir: Path
     # When set, requests whose Host header is not listed get 403. This is the
     # standard DNS-rebinding defense for localhost servers: a malicious site
     # rebinding its hostname to 127.0.0.1 sends its own domain as Host and can
     # otherwise read the whole index cross-origin. None = no filtering (used
     # for non-loopback binds, which are network-exposed by explicit choice).
     allowed_hosts: set[str] | None = None
+    # Control-panel state. Writes are refused outright unless `writable` (set
+    # only for loopback binds) and gated on a token minted at server start and
+    # embedded in the page — a rebinding attacker cannot read the page to learn
+    # it, so blind cross-origin POSTs fail even if a Host check were bypassed.
+    config: Config | None = None
+    jobs = None
+    csrf_token: str = ""
+    writable: bool = False
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args) -> None:  # route to logging, not stderr
@@ -317,6 +432,27 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, msg: str) -> None:
         self._json({"error": msg}, status=status)
 
+    def _host_ok(self) -> bool:
+        if self.allowed_hosts is None:
+            return True
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in self.allowed_hosts
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        if length > 1 << 20:
+            raise ValueError("request body too large")
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw or b"{}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"invalid JSON body: {e}") from e
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        return data
+
     # -- routing --
 
     def do_GET(self) -> None:  # noqa: N802 — http.server API
@@ -331,22 +467,104 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _route(self) -> None:
-        if self.allowed_hosts is not None:
-            host = (self.headers.get("Host") or "").strip().lower()
-            if host not in self.allowed_hosts:
+    def do_POST(self) -> None:  # noqa: N802 — http.server API
+        from .control import SettingsError
+        from .jobs import JobError
+
+        try:
+            if not self._host_ok():
                 return self._error(403, "forbidden Host header")
+            if not self.writable:
+                return self._error(
+                    403,
+                    "this server is read-only: settings and jobs are disabled when "
+                    "bound to a non-loopback address",
+                )
+            if self.headers.get("X-CSRF-Token", "") != self.csrf_token:
+                return self._error(403, "missing or stale CSRF token — reload the page")
+            self._route_post()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except (SettingsError, JobError, ValueError) as e:
+            self._error(400, str(e))
+        except Exception as e:  # noqa: BLE001 — keep the server alive
+            log.exception("write request failed: %s", self.path)
+            try:
+                self._error(500, str(e))
+            except OSError:
+                pass
+
+    def _route_post(self) -> None:
+        from . import control
+        from .jobs import JobError
+
+        parts = [p for p in urlparse(self.path).path.split("/") if p]
+        body = self._read_json()
+        cfg = self.config
+
+        if parts == ["api", "roots"]:
+            return self._json({"added": control.add_root(cfg, body.get("path", ""))})
+        if parts == ["api", "roots", "remove"]:
+            return self._json({"removed": control.remove_root(cfg, body.get("path", ""))})
+        if parts == ["api", "excludes"]:
+            return self._json({"added": control.add_exclude(cfg, body.get("pattern", ""))})
+        if parts == ["api", "excludes", "remove"]:
+            return self._json(
+                {"removed": control.remove_exclude(cfg, body.get("pattern", ""))}
+            )
+        if len(parts) == 3 and parts[:2] == ["api", "settings"]:
+            changed = control.update_section(cfg, parts[2], body.get("values", {}))
+            return self._json({"changed": changed})
+        if parts == ["api", "jobs"]:
+            job = self.jobs.start(body.get("name", ""), body.get("args") or [])
+            return self._json(job.summary(), status=201)
+        if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "stop":
+            if not parts[2].isdigit():
+                raise JobError("bad job id")
+            job = self.jobs.stop(int(parts[2]), force=bool(body.get("force")))
+            return self._json(job.summary())
+        self._error(404, "not found")
+
+    def _route(self) -> None:
+        if not self._host_ok():
+            return self._error(403, "forbidden Host header")
         url = urlparse(self.path)
         qs = parse_qs(url.query)
         parts = [p for p in url.path.split("/") if p]
 
         if not parts:
-            body = WEB_UI.encode()
+            page = WEB_UI.replace("__CSRF_TOKEN__", self.csrf_token).replace(
+                "__WRITABLE__", "true" if self.writable else "false"
+            )
+            body = page.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif parts == ["api", "settings"]:
+            from .control import settings_payload
+
+            payload = settings_payload(self.config)
+            payload["writable"] = self.writable
+            self._json(payload)
+        elif parts == ["api", "fs"]:
+            from .control import list_directory
+
+            try:
+                self._json(list_directory(qs.get("path", [""])[0] or None))
+            except Exception as e:  # noqa: BLE001 — surfaced to the picker
+                self._error(400, str(e))
+        elif parts == ["api", "status"]:
+            self._json(self.store.status())
+        elif parts == ["api", "jobs"]:
+            self._json({"jobs": self.jobs.list(), "writable": self.writable})
+        elif len(parts) == 3 and parts[:2] == ["api", "jobs"] and parts[2].isdigit():
+            job = self.jobs.get(int(parts[2]))
+            if job is None:
+                self._error(404, "unknown job")
+            else:
+                self._json(job.detail())
         elif parts == ["api", "summary"]:
             self._json(self.store.summary())
         elif parts == ["api", "files"]:
@@ -399,8 +617,16 @@ class Handler(BaseHTTPRequestHandler):
         src, _kind = info
         if not src.is_file():
             return self._error(404, "file missing on disk")
-        size = src.stat().st_size
+        ext = src.suffix.lower()
         ctype = mimetypes.guess_type(src.name)[0] or "application/octet-stream"
+        if ext in PREVIEW_IMAGE_EXTS or ext in PREVIEW_VIDEO_EXTS:
+            preview_ext = ".jpg" if ext in PREVIEW_IMAGE_EXTS else ".mp4"
+            out = self.preview_dir / f"{file_id}-{int(src.stat().st_mtime)}{preview_ext}"
+            if not out.exists() and _make_preview(src, out) is None:
+                return self._error(404, "preview unavailable for this file")
+            src = out
+            ctype = "image/jpeg" if preview_ext == ".jpg" else "video/mp4"
+        size = src.stat().st_size
         start, end = 0, size - 1
         status = 200
         m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
@@ -441,13 +667,34 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+    import secrets
+
+    from .jobs import JobRunner
+
     thumb_dir = cfg.data_dir / "thumbs"
     thumb_dir.mkdir(parents=True, exist_ok=True)
+    preview_dir = cfg.data_dir / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    # The control panel edits config and launches jobs, so it is enabled only
+    # on a loopback bind. Exposing it on a LAN address would hand anyone who
+    # can reach the port the ability to index arbitrary directories.
+    writable = is_loopback(host)
     handler = type(
-        "BoundHandler", (Handler,), {"store": Store(cfg.db_path), "thumb_dir": thumb_dir}
+        "BoundHandler",
+        (Handler,),
+        {
+            "store": Store(cfg.db_path),
+            "thumb_dir": thumb_dir,
+            "preview_dir": preview_dir,
+            "config": cfg,
+            "jobs": JobRunner(),
+            "csrf_token": secrets.token_urlsafe(32),
+            "writable": writable,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
+    server.job_runner = handler.jobs  # so serve() can stop jobs on shutdown
     if is_loopback(host):
         actual_port = server.server_address[1]  # resolved when port=0
         allowed = set()
@@ -472,266 +719,7 @@ def serve(
     except KeyboardInterrupt:
         pass
     finally:
+        runner = getattr(server, "job_runner", None)
+        if runner is not None:
+            runner.shutdown()  # don't orphan a scan/deep when the UI stops
         server.server_close()
-
-
-# ---------- UI (single page, no external assets) ----------
-
-WEB_UI = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>file-index browser</title>
-<style>
-:root {
-  --bg: #101014; --panel: #17171d; --card: #1c1c24; --border: #2a2a35;
-  --text: #e8e8ee; --dim: #9a9aa8; --accent: #7aa2f7; --badge: #242430;
-}
-* { box-sizing: border-box; margin: 0; }
-body { background: var(--bg); color: var(--text);
-  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-header { position: sticky; top: 0; z-index: 10; background: var(--panel);
-  border-bottom: 1px solid var(--border); padding: 10px 16px;
-  display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-header h1 { font-size: 15px; font-weight: 600; margin-right: 6px; }
-#q { flex: 1 1 220px; max-width: 420px; background: var(--card); color: var(--text);
-  border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; outline: none; }
-#q:focus { border-color: var(--accent); }
-.chip { background: var(--card); border: 1px solid var(--border); color: var(--dim);
-  border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 13px; }
-.chip.on { color: var(--text); border-color: var(--accent); background: #20283e; }
-label.cap { color: var(--dim); display: flex; gap: 6px; align-items: center;
-  cursor: pointer; font-size: 13px; }
-#count { color: var(--dim); font-size: 13px; margin-left: auto; }
-#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: 14px; padding: 16px; }
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-  overflow: hidden; cursor: pointer; display: flex; flex-direction: column; }
-.card:hover { border-color: var(--accent); }
-.thumb { aspect-ratio: 16/10; background: #0c0c10; display: flex;
-  align-items: center; justify-content: center; overflow: hidden; }
-.thumb img { width: 100%; height: 100%; object-fit: cover; }
-.thumb .ph { font-size: 34px; opacity: .45; }
-.card .body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 6px; }
-.card .name { font-weight: 600; font-size: 13px; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
-.card .cap-text { color: var(--dim); font-size: 12.5px; display: -webkit-box;
-  -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.badges { display: flex; gap: 6px; flex-wrap: wrap; }
-.badge { background: var(--badge); color: var(--dim); border-radius: 5px;
-  font-size: 11px; padding: 2px 7px; }
-#sentinel { height: 60px; }
-#empty { color: var(--dim); text-align: center; padding: 60px 0; display: none; }
-/* modal */
-#overlay { position: fixed; inset: 0; background: rgba(0,0,0,.65); display: none;
-  z-index: 20; align-items: center; justify-content: center; padding: 24px; }
-#overlay.open { display: flex; }
-#modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-  width: min(1200px, 100%); max-height: 92vh; display: flex; overflow: hidden; }
-#m-media { flex: 1.4; background: #000; display: flex; align-items: center;
-  justify-content: center; min-width: 0; }
-#m-media img, #m-media video { max-width: 100%; max-height: 92vh; object-fit: contain; }
-#m-media .ph { font-size: 80px; opacity: .4; }
-#m-side { flex: 1; min-width: 320px; max-width: 460px; overflow-y: auto; padding: 18px; }
-#m-side h2 { font-size: 15px; word-break: break-all; margin-bottom: 4px; }
-#m-side .path { color: var(--dim); font-size: 12px; word-break: break-all;
-  cursor: pointer; margin-bottom: 10px; }
-#m-side .path:hover { color: var(--accent); }
-#m-side section { border-top: 1px solid var(--border); padding: 12px 0; }
-#m-side section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
-  color: var(--accent); margin-bottom: 6px; }
-#m-side p, #m-side pre { color: var(--text); font-size: 13px; white-space: pre-wrap;
-  word-break: break-word; }
-#m-side pre { max-height: 260px; overflow-y: auto; background: var(--card);
-  border-radius: 8px; padding: 8px 10px; font-size: 12px; }
-#m-close { position: absolute; top: 14px; right: 18px; font-size: 26px; color: #fff;
-  background: none; border: none; cursor: pointer; opacity: .7; }
-#m-close:hover { opacity: 1; }
-@media (max-width: 800px) { #modal { flex-direction: column; overflow-y: auto; }
-  #m-side { max-width: none; } }
-</style>
-</head>
-<body>
-<header>
-  <h1>file-index</h1>
-  <input id="q" type="search" placeholder="Search captions, text, transcripts…">
-  <div id="chips"></div>
-  <label class="cap"><input id="captioned" type="checkbox"> captioned only</label>
-  <span id="count"></span>
-</header>
-<div id="grid"></div>
-<div id="empty">No files match.</div>
-<div id="sentinel"></div>
-<div id="overlay"><button id="m-close">&times;</button><div id="modal">
-  <div id="m-media"></div><div id="m-side"></div>
-</div></div>
-<script>
-"use strict";
-const state = { q: "", kind: "", captioned: false, offset: 0, total: 0, busy: false, done: false };
-const PAGE = 60;
-const ICONS = { image: "🖼", video: "🎬", audio: "🎧", pdf: "📄", text: "📄",
-  code: "⌨", office: "📄", other: "📦" };
-const $ = (id) => document.getElementById(id);
-
-function el(tag, cls, text) {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (text !== undefined) e.textContent = text;
-  return e;
-}
-
-async function loadSummary() {
-  const s = await (await fetch("api/summary")).json();
-  const chips = $("chips");
-  const mk = (label, kind, n) => {
-    const c = el("button", "chip" + (state.kind === kind ? " on" : ""),
-      n === undefined ? label : `${label} ${n.toLocaleString()}`);
-    c.onclick = () => { state.kind = kind; refresh();
-      [...chips.children].forEach(x => x.classList.remove("on")); c.classList.add("on"); };
-    chips.appendChild(c);
-  };
-  mk("All", "", s.total);
-  for (const k of Object.keys(s.kinds).sort((a, b) => s.kinds[b] - s.kinds[a]))
-    mk(k, k, s.kinds[k]);
-}
-
-function card(f) {
-  const c = el("div", "card");
-  const t = el("div", "thumb");
-  if (["image", "video", "pdf"].includes(f.kind)) {
-    const img = el("img");
-    img.loading = "lazy";
-    img.src = "thumb/" + f.id;
-    img.onerror = () => { t.textContent = ""; t.appendChild(el("span", "ph", ICONS[f.kind] || "📦")); };
-    t.appendChild(img);
-  } else {
-    t.appendChild(el("span", "ph", ICONS[f.kind] || "📦"));
-  }
-  const body = el("div", "body");
-  body.appendChild(el("div", "name", f.path.split("/").pop()));
-  const badges = el("div", "badges");
-  badges.appendChild(el("span", "badge", f.kind));
-  if (f.vlm_type && f.vlm_type !== "other") badges.appendChild(el("span", "badge", f.vlm_type));
-  if (f.degraded) badges.appendChild(el("span", "badge", "degraded"));
-  body.appendChild(badges);
-  body.appendChild(el("div", "cap-text",
-    f.caption || (f.tier2_status ? "(no caption)" : "(not yet processed by deep)")));
-  c.append(t, body);
-  c.onclick = () => openModal(f.id);
-  return c;
-}
-
-async function loadPage() {
-  if (state.busy || state.done) return;
-  state.busy = true;
-  const p = new URLSearchParams({ q: state.q, kind: state.kind,
-    captioned: state.captioned ? "1" : "", offset: state.offset, limit: PAGE });
-  const r = await (await fetch("api/files?" + p)).json();
-  state.total = r.total;
-  for (const f of r.files) $("grid").appendChild(card(f));
-  state.offset += r.files.length;
-  state.done = state.offset >= r.total || r.files.length === 0;
-  $("count").textContent = `${state.offset.toLocaleString()} of ${r.total.toLocaleString()}`;
-  $("empty").style.display = r.total === 0 ? "block" : "none";
-  state.busy = false;
-}
-
-function refresh() {
-  state.offset = 0; state.done = false;
-  $("grid").textContent = "";
-  loadPage();
-}
-
-// modal ---------------------------------------------------------------
-function section(title, contentEl) {
-  const s = el("section");
-  s.appendChild(el("h3", "", title));
-  s.appendChild(contentEl);
-  return s;
-}
-
-async function openModal(id) {
-  const d = await (await fetch("api/file/" + id)).json();
-  const media = $("m-media"), side = $("m-side");
-  media.textContent = ""; side.textContent = "";
-  if (d.kind === "image") {
-    const img = el("img"); img.src = "media/" + d.id; media.appendChild(img);
-  } else if (d.kind === "video") {
-    const v = el("video"); v.controls = true; v.src = "media/" + d.id;
-    media.appendChild(v);
-  } else if (d.kind === "audio") {
-    const a = el("audio"); a.controls = true; a.src = "media/" + d.id;
-    media.appendChild(a);
-  } else {
-    media.appendChild(el("span", "ph", ICONS[d.kind] || "📦"));
-  }
-  side.appendChild(el("h2", "", d.path.split("/").pop()));
-  const path = el("div", "path", d.path + "  (click to copy)");
-  path.onclick = () => navigator.clipboard.writeText(d.path);
-  side.appendChild(path);
-  const info = el("div", "badges");
-  info.appendChild(el("span", "badge", d.kind));
-  info.appendChild(el("span", "badge", (d.size / 1048576).toFixed(2) + " MB"));
-  info.appendChild(el("span", "badge", new Date(d.mtime * 1000).toLocaleString()));
-  side.appendChild(info);
-  if (d.error) side.appendChild(section("Processing error", el("p", "", d.error)));
-  for (const c of d.content) side.appendChild(renderStage(c));
-  $("overlay").classList.add("open");
-}
-
-function renderStage(c) {
-  const m = typeof c.meta === "object" && c.meta !== null ? c.meta : null;
-  if (c.stage === "vlm_image" && m) {
-    const box = el("div");
-    if (m.description) box.appendChild(el("p", "", m.description));
-    if (m.ocr_text) {
-      box.appendChild(el("h3", "", "Text in image"));
-      box.appendChild(el("pre", "", m.ocr_text));
-    }
-    if (m.objects && m.objects.length) {
-      const b = el("div", "badges");
-      for (const o of m.objects) b.appendChild(el("span", "badge", o));
-      box.appendChild(b);
-    }
-    if (m.inferred_context) box.appendChild(el("p", "", "Context: " + m.inferred_context));
-    return section("Image analysis" + (c.degraded ? " (degraded)" : ""), box);
-  }
-  if (c.stage === "exif" && m) {
-    const pre = el("pre", "", Object.entries(m)
-      .map(([k, v]) => k + ": " + JSON.stringify(v)).join("\n"));
-    return section("EXIF", pre);
-  }
-  const titles = { text: "Extracted text", pdf_text: "PDF text", pdf_scan_vlm: "Scanned PDF",
-    whisper: "Transcript", audio_summary: "Audio summary", video_scenes: "Scenes",
-    video_transcript: "Video transcript", video_summary: "Video summary" };
-  const body = (c.body || "").slice(0, 20000);
-  const node = ["video_summary", "audio_summary"].includes(c.stage)
-    ? el("p", "", body)
-    : el("pre", "", body || (c.degraded ? "(nothing could be extracted)" : ""));
-  return section((titles[c.stage] || c.stage) + (c.degraded ? " (degraded)" : ""), node);
-}
-
-function closeModal() {
-  $("overlay").classList.remove("open");
-  $("m-media").textContent = "";  // stop any playing video
-}
-$("overlay").onclick = (e) => { if (e.target.id === "overlay") closeModal(); };
-$("m-close").onclick = closeModal;
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
-
-// wiring --------------------------------------------------------------
-let debounce;
-$("q").oninput = () => {
-  clearTimeout(debounce);
-  debounce = setTimeout(() => { state.q = $("q").value; refresh(); }, 300);
-};
-$("captioned").onchange = () => { state.captioned = $("captioned").checked; refresh(); };
-new IntersectionObserver((es) => { if (es[0].isIntersecting) loadPage(); })
-  .observe($("sentinel"));
-loadSummary();
-loadPage();
-</script>
-</body>
-</html>
-"""
