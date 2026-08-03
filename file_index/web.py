@@ -191,6 +191,23 @@ class Store:
 # ---------- thumbnails ----------
 
 
+def prune_thumbs(thumb_dir: Path, live_keys: set[str]) -> int:
+    """Delete cached thumbnails that no live file claims. Thumbs are named
+    `<file_id>-<mtime>.jpg`, so both deleted files and superseded versions of
+    a still-live file are collected. Returns the number removed."""
+    if not thumb_dir.is_dir():
+        return 0
+    removed = 0
+    for p in thumb_dir.glob("*.jpg"):
+        if p.stem not in live_keys:
+            try:
+                p.unlink()
+                removed += 1
+            except OSError as e:  # noqa: PERF203 — best-effort cache cleanup
+                log.debug("could not remove stale thumb %s: %s", p, e)
+    return removed
+
+
 def _make_thumb(src: Path, kind: str, out: Path) -> Path | None:
     """Generate a JPEG thumbnail for an image/video/pdf. None if unsupported."""
     try:

@@ -397,6 +397,55 @@ def exclude(
 
 
 @app.command()
+def purge(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+    older_than_days: float = typer.Option(
+        0.0, "--older-than-days",
+        help="Only purge files soft-deleted longer ago than this (0 = all).",
+    ),
+) -> None:
+    """Permanently delete indexed data for files removed from the index.
+
+    Files deleted from disk or removed with `exclude` are only soft-deleted:
+    their extracted text, captions and transcripts stay in the database (so
+    the removal stays reversible). This erases that data for good and prunes
+    the thumbnail cache. Files on disk are never touched.
+    """
+    import time as _time
+
+    cfg, index = _load()
+    cutoff = _time.time() - older_than_days * 86400 if older_than_days > 0 else None
+    where = "deleted=1" + (" AND updated_at < ?" if cutoff else "")
+    params: tuple = (cutoff,) if cutoff else ()
+    n = index.db.execute(
+        f"SELECT COUNT(*) n FROM files WHERE {where}", params
+    ).fetchone()["n"]
+    if not n:
+        console.print("nothing to purge — no soft-deleted files match")
+        return
+    if not yes and not typer.confirm(
+        f"Permanently erase indexed content for {n} removed file(s)? "
+        "(files on disk are untouched; this cannot be undone)",
+        default=False,
+    ):
+        console.print("aborted — nothing changed")
+        return
+
+    stats = index.purge_deleted(older_than=cutoff)
+    from .web import prune_thumbs
+
+    thumbs = prune_thumbs(cfg.data_dir / "thumbs", index.live_thumb_keys())
+    index.audit("purge", None, None,
+                f"files={stats['files']} content={stats['content']} "
+                f"chunks={stats['chunks']} thumbs={thumbs}")
+    console.print(
+        f"purged [green]{stats['files']} files[/green] "
+        f"({stats['content']} extractions, {stats['chunks']} chunks, "
+        f"{thumbs} cached thumbnails). Run [bold]file-index status[/bold] to see the new size."
+    )
+
+
+@app.command()
 def watch() -> None:
     """Watch roots for changes and index them incrementally (daemon)."""
     cfg, index = _load()
