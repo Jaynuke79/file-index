@@ -37,6 +37,7 @@ file-index organize ~/Downloads            # prints a plan, changes nothing
 file-index organize ~/Downloads --apply    # applies moves/renames after confirmation
 file-index browse            # local web gallery: files + captions, search, filters
 file-index exclude PATH      # remove files from the index + future scans (disk untouched)
+file-index reindex           # re-extract stages whose extractor or model changed
 file-index purge             # erase indexed data of removed/excluded files for good
 file-index status            # queue stats, per-type counts, failures
 file-index watch             # incremental watcher (or install the systemd unit)
@@ -137,8 +138,15 @@ agent CLI ← search/organize tools ← index
   with timestamps, and the video pipeline (PySceneDetect scenes → frame
   captions → transcript → agent-model summary). Video/audio chunks carry
   timestamp ranges so search hits resolve to a moment.
-- Extractions are versioned per stage (`content.extractor_version`) so any
-  stage can be re-run later with a better model without touching the others.
+- Extractions are versioned per stage (`content.extractor_version`), and the
+  version records the model for stages that depend on one
+  (`image-1.2+qwen2.5vl:32b`). `file-index reindex` compares those against
+  what the current code and config would produce and re-queues only the files
+  that differ — so pointing `models.vision` at a better VLM re-captions your
+  images without touching transcripts, text, or anything else. Use
+  `--dry-run` to preview, `--stage` to narrow, `--force` to redo regardless.
+  Rows written before versions carried model names are judged on the
+  extractor version alone, so upgrading doesn't re-run everything once.
 
 ## Tests
 

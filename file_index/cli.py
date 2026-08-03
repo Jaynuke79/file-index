@@ -397,6 +397,67 @@ def exclude(
 
 
 @app.command()
+def reindex(
+    stage: list[str] = typer.Option(
+        None, "--stage", "-s",
+        help="Limit to these stages (repeatable). Default: every stage.",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Re-run even where the stored version matches."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be re-extracted and exit."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Re-extract stages whose extractor or model has changed.
+
+    Every stored extraction records the version that produced it, including
+    the model for model-dependent stages. This compares that against what the
+    current code and config.yaml would produce and re-queues only the files
+    that differ — run `scan` (tier 1) or `deep` (tier 2) afterwards to do the
+    work. Other stages of the same file are left alone.
+    """
+    cfg, index = _load()
+    from .reindex import find_stale, requeue, stage_version
+
+    try:
+        stale = find_stale(index, cfg, stages=list(stage) if stage else None, force=force)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    if not stale:
+        console.print(
+            "everything is up to date — no stage's extractor or model has changed"
+        )
+        return
+
+    table = Table(title="stages to re-extract")
+    table.add_column("stage")
+    table.add_column("files", justify="right")
+    table.add_column("current version", overflow="fold")
+    for st in sorted(stale, key=lambda s: -len(stale[s])):
+        table.add_row(st, str(len(stale[st])), stage_version(st, cfg))
+    console.print(table)
+
+    if dry_run:
+        console.print("[dim]--dry-run: nothing was queued[/dim]")
+        return
+    total = len({f[0] for files in stale.values() for f in files})
+    if not yes and not typer.confirm(
+        f"Re-queue {total} file(s) for re-extraction?", default=False
+    ):
+        console.print("aborted — nothing changed")
+        return
+    counts = requeue(index, stale)
+    console.print(
+        f"queued [green]{counts['tier1']}[/green] file(s) for tier 1 and "
+        f"[green]{counts['tier2']}[/green] for tier 2. "
+        "Run [bold]file-index scan[/bold] / [bold]file-index deep[/bold] to process them."
+    )
+
+
+@app.command()
 def purge(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
     older_than_days: float = typer.Option(

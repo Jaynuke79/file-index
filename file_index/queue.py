@@ -163,6 +163,13 @@ class Tier2Worker:
         self.client = client or OllamaClient(config.models.ollama_url)
         self.embedder = Embedder(config, self.client)
 
+    def _version(self, stage: str) -> str:
+        """Version to stamp on a stage written now — includes the configured
+        model for model-dependent stages so `reindex` can spot a model swap."""
+        from .reindex import stage_version
+
+        return stage_version(stage, self.config)
+
     def pending_count(self) -> int:
         row = self.index.db.execute(
             "SELECT COUNT(*) n FROM queue WHERE tier=2 "
@@ -339,7 +346,7 @@ class Tier2Worker:
 
         stage = TRANSCRIPT_STAGE[kind]
         tcid = self.index.store_content(
-            file_id, stage, audio_ex.VERSION,
+            file_id, stage, self._version(stage),
             audio_ex.format_transcript(t["segments"]),
             meta={"language": t["language"], "duration": t["duration"],
                   "segments": t["segments"]},
@@ -398,7 +405,7 @@ class Tier2Worker:
         ))
         if summary:
             scid = self.index.store_content(
-                file_id, "video_summary", video_ex.VERSION, summary
+                file_id, "video_summary", self._version("video_summary"), summary
             )
             schunks = chunk_text(summary, self.config.limits.chunk_tokens,
                                  self.config.limits.chunk_overlap_tokens)
@@ -424,7 +431,7 @@ class Tier2Worker:
         )
         if summary:
             scid = self.index.store_content(
-                file_id, "audio_summary", audio_ex.VERSION, summary
+                file_id, "audio_summary", self._version("audio_summary"), summary
             )
             schunks = chunk_text(summary, self.config.limits.chunk_tokens,
                                  self.config.limits.chunk_overlap_tokens)
@@ -511,12 +518,12 @@ class Tier2Worker:
         )
         if degraded:
             self.index.store_content(
-                item["file_id"], "vlm_image", image_ex.VERSION, raw, degraded=True
+                item["file_id"], "vlm_image", self._version("vlm_image"), raw, degraded=True
             )
             return
         body = image_ex.vlm_body_text(data)
         cid = self.index.store_content(
-            item["file_id"], "vlm_image", image_ex.VERSION, body, meta=data
+            item["file_id"], "vlm_image", self._version("vlm_image"), body, meta=data
         )
         chunks = chunk_text(body, self.config.limits.chunk_tokens,
                             self.config.limits.chunk_overlap_tokens)
@@ -583,7 +590,7 @@ class Tier2Worker:
                 parts.append(f"[page {pno + 1}]\n{text}")
         body = "\n\n".join(parts)
         cid = self.index.store_content(
-            item["file_id"], "pdf_scan_vlm", image_ex.VERSION, body
+            item["file_id"], "pdf_scan_vlm", self._version("pdf_scan_vlm"), body
         )
         chunks = chunk_text(body, self.config.limits.chunk_tokens,
                             self.config.limits.chunk_overlap_tokens)
@@ -608,7 +615,7 @@ class Tier2Worker:
         )
         transcript_text = audio_ex.format_transcript(result["segments"])
         cid = self.index.store_content(
-            item["file_id"], "whisper", audio_ex.VERSION, transcript_text,
+            item["file_id"], "whisper", self._version("whisper"), transcript_text,
             meta={"language": result["language"], "duration": result["duration"],
                   "segments": result["segments"]},
         )
@@ -626,7 +633,7 @@ class Tier2Worker:
                 summary = strip_think(summary)
                 if summary:
                     scid = self.index.store_content(
-                        item["file_id"], "audio_summary", audio_ex.VERSION, summary
+                        item["file_id"], "audio_summary", self._version("audio_summary"), summary
                     )
                     schunks = chunk_text(summary, self.config.limits.chunk_tokens,
                                          self.config.limits.chunk_overlap_tokens)
@@ -673,7 +680,7 @@ class Tier2Worker:
             )
             scene_chunks.append({"text": cap, "ts_start": s["start"], "ts_end": s["end"]})
         cid = self.index.store_content(
-            file_id, "video_scenes", video_ex.VERSION, "\n".join(scene_lines),
+            file_id, "video_scenes", self._version("video_scenes"), "\n".join(scene_lines),
             meta={"scenes": result["scenes"]},
         )
         self.index.store_chunks(file_id, cid, "video_scenes",
@@ -685,7 +692,7 @@ class Tier2Worker:
         summary = strip_think(result["summary"])
         if summary:
             scid = self.index.store_content(
-                file_id, "video_summary", video_ex.VERSION, summary
+                file_id, "video_summary", self._version("video_summary"), summary
             )
             schunks = chunk_text(summary, self.config.limits.chunk_tokens,
                                  self.config.limits.chunk_overlap_tokens)
