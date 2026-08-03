@@ -23,6 +23,19 @@ from .util import format_ts, strip_think
 
 log = logging.getLogger("file_index.queue")
 
+# Per-kind stage names for the shared transcribe/summarize machinery.
+TRANSCRIPT_STAGE = {"audio": "whisper", "video": "video_transcript"}
+SUMMARY_STAGE = {"audio": "audio_summary", "video": "video_summary"}
+
+AUDIO_SUMMARY_PROMPT = (
+    "Summarize this audio transcript in a short paragraph. /no_think\n\n"
+)
+
+
+def _item_kind(item) -> str:
+    """Queue routing kind for a row ('audio', 'video', 'image', 'pdf_scan')."""
+    return item["kind"] or item["file_kind"]
+
 
 class Tier1Worker:
     """Fast pass: text/code/pdf/office extraction + EXIF. No model calls except
@@ -269,6 +282,7 @@ class Tier2Worker:
         (pinned) vision model into partial CPU offload, slowing every caption
         ~30x. The configured device still applies to inline transcription.
         """
+        from .extractors import audio as audio_ex
         from .extractors import video as video_ex
 
         if len(in_flight) >= max_in_flight:
@@ -283,9 +297,15 @@ class Tier2Worker:
                 break
             if it["id"] in in_flight:
                 continue
+            # Audio files are transcribed directly; videos need their audio
+            # track demuxed first.
+            fn = (
+                audio_ex.transcribe
+                if _item_kind(it) == "audio"
+                else video_ex.transcribe_video
+            )
             fut = transcriber.submit(
-                video_ex.transcribe_video, Path(it["path"]),
-                self.config.models.whisper, "cpu", "int8",
+                fn, Path(it["path"]), self.config.models.whisper, "cpu", "int8",
             )
             in_flight[it["id"]] = (fut, it)
 
@@ -310,21 +330,22 @@ class Tier2Worker:
                 log.warning("whisper failed for %s: %s", path, e)
                 transcript = None
             if transcript and transcript["segments"]:
-                self._store_transcript(item["file_id"], transcript)
+                self._store_transcript(item["file_id"], transcript, _item_kind(item))
             self.index.set_queue_status(qid, PENDING_SUMMARY)
             self.index.commit()
 
-    def _store_transcript(self, file_id: int, t: dict) -> None:
+    def _store_transcript(self, file_id: int, t: dict, kind: str = "video") -> None:
         from .extractors import audio as audio_ex
 
+        stage = TRANSCRIPT_STAGE[kind]
         tcid = self.index.store_content(
-            file_id, "video_transcript", audio_ex.VERSION,
+            file_id, stage, audio_ex.VERSION,
             audio_ex.format_transcript(t["segments"]),
             meta={"language": t["language"], "duration": t["duration"],
                   "segments": t["segments"]},
         )
         tchunks = chunk_segments(t["segments"], self.config.limits.chunk_tokens)
-        self.index.store_chunks(file_id, tcid, "video_transcript",
+        self.index.store_chunks(file_id, tcid, stage,
                                 self.embedder.embed_chunks(tchunks))
 
     def _summary_sweep(self, progress_cb, stop_check, done_so_far: int) -> int:
@@ -360,11 +381,13 @@ class Tier2Worker:
         return failed
 
     def _summarize_deferred(self, item, path: Path) -> None:
-        """Generate + store the summary for a video whose captions/transcript
+        """Generate + store the summary for a file whose captions/transcript
         were stored earlier in the run (or a previous, interrupted run)."""
         from .extractors import video as video_ex
 
         file_id = item["file_id"]
+        if _item_kind(item) == "audio":
+            return self._summarize_deferred_audio(item, path)
         scenes = self.index.get_content(file_id, "video_scenes")
         transcript = self.index.get_content(file_id, "video_transcript")
         captions_text = (scenes[0]["body"] if scenes else "") or "(no captions available)"
@@ -380,6 +403,32 @@ class Tier2Worker:
             schunks = chunk_text(summary, self.config.limits.chunk_tokens,
                                  self.config.limits.chunk_overlap_tokens)
             self.index.store_chunks(file_id, scid, "video_summary",
+                                    self.embedder.embed_chunks(schunks))
+
+    def _summarize_deferred_audio(self, item, path: Path) -> None:
+        """Agent-model summary over an audio file's stored transcript. Runs in
+        the end-of-run sweep with the agent model loaded once, instead of
+        swapping it against the vision model per file."""
+        from .extractors import audio as audio_ex
+
+        file_id = item["file_id"]
+        rows = self.index.get_content(file_id, "whisper")
+        transcript_text = (rows[0]["body"] if rows else "") or ""
+        if not transcript_text.strip():
+            return  # silence / no speech: nothing to summarize
+        summary = strip_think(
+            self.client.generate(
+                self.config.models.agent,
+                AUDIO_SUMMARY_PROMPT + transcript_text[:30000],
+            ).strip()
+        )
+        if summary:
+            scid = self.index.store_content(
+                file_id, "audio_summary", audio_ex.VERSION, summary
+            )
+            schunks = chunk_text(summary, self.config.limits.chunk_tokens,
+                                 self.config.limits.chunk_overlap_tokens)
+            self.index.store_chunks(file_id, scid, "audio_summary",
                                     self.embedder.embed_chunks(schunks))
 
     def _top_up_prefetch(
@@ -419,8 +468,8 @@ class Tier2Worker:
             return None
 
     def _process(self, item, path: Path, prep: dict | None = None) -> str | None:
-        """Returns "defer_summary" when the item must move to the summary
-        sweep instead of being marked done, else None."""
+        """Returns "defer_transcript"/"defer_summary" when the item must move
+        to a later stage instead of being marked done, else None."""
         if not path.exists():
             raise FileNotFoundError(path)
         if self._reuse_duplicate(item, path):
@@ -431,7 +480,7 @@ class Tier2Worker:
         elif kind == "pdf_scan":
             self._process_pdf_scan(item, path)
         elif kind == "audio":
-            self._process_audio(item, path)
+            return self._process_audio(item, path)
         elif kind == "video":
             return self._process_video(item, path, prep)
         else:
@@ -541,8 +590,15 @@ class Tier2Worker:
         self.index.store_chunks(item["file_id"], cid, "pdf_scan_vlm",
                                 self.embedder.embed_chunks(chunks))
 
-    def _process_audio(self, item, path: Path) -> None:
+    def _process_audio(self, item, path: Path) -> str | None:
+        """With summaries deferred (the default), audio does no work on the
+        critical path at all: transcription happens on the background CPU
+        thread and the summary in the end-of-run sweep, so neither Whisper nor
+        the agent model ever competes with the pinned vision model."""
         from .extractors import audio as audio_ex
+
+        if self.config.deep.defer_video_summaries:
+            return "defer_transcript"
 
         result = audio_ex.transcribe(
             path,

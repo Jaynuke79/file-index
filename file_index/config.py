@@ -83,10 +83,12 @@ class DeepConfig:
     # folder of similar clips (same game, same people) is understood as such.
     # 0 disables.
     neighbor_context: int = 3
-    # Defer video summaries to an end-of-run sweep: all captioning runs with
-    # the vision model resident, then all summaries run with the agent model
-    # loaded once — instead of a ~15 s vision<->agent VRAM swap per video.
-    # Scenes/transcripts are stored immediately either way.
+    # Defer summaries to an end-of-run sweep: all captioning runs with the
+    # vision model resident, then all summaries run with the agent model
+    # loaded once — instead of a ~15 s vision<->agent VRAM swap per file.
+    # Also keeps Whisper on the background CPU thread. Applies to audio as
+    # well as video (the name predates audio joining the same pipeline);
+    # disabling it restores fully inline per-file processing.
     defer_video_summaries: bool = True
 
 
