@@ -13,6 +13,8 @@ import logging
 import threading
 from pathlib import Path
 
+from ..util import format_ts
+
 log = logging.getLogger("file_index.extractors.audio")
 
 VERSION = "whisper-large-v3-1.0"
@@ -68,11 +70,6 @@ def format_transcript(segments: list[dict]) -> str:
     """Human-readable timestamped transcript for storage/FTS."""
     lines = []
     for s in segments:
-        lines.append(f"[{_ts(s['start'])} - {_ts(s['end'])}] {s['text']}")
+        lines.append(f"[{format_ts(s['start'])} - {format_ts(s['end'])}] {s['text']}")
     return "\n".join(lines)
 
-
-def _ts(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"

@@ -19,6 +19,7 @@ from .extractors import pdf as pdf_ex
 from .extractors import text as text_ex
 from .index import PENDING_SUMMARY, PENDING_TRANSCRIPT, Index
 from .ollama_client import OllamaClient
+from .util import format_ts, strip_think
 
 log = logging.getLogger("file_index.queue")
 
@@ -368,7 +369,7 @@ class Tier2Worker:
         transcript = self.index.get_content(file_id, "video_transcript")
         captions_text = (scenes[0]["body"] if scenes else "") or "(no captions available)"
         transcript_text = (transcript[0]["body"] if transcript else "") or "(no speech / no audio track)"
-        summary = _strip_think(video_ex.summarize_video(
+        summary = strip_think(video_ex.summarize_video(
             self.client, self.config.models.agent, captions_text, transcript_text,
             context=self._neighbor_context(file_id, path),
         ))
@@ -566,7 +567,7 @@ class Tier2Worker:
                     "Summarize this audio transcript in a short paragraph. /no_think\n\n"
                     + result["text"][:30000],
                 ).strip()
-                summary = _strip_think(summary)
+                summary = strip_think(summary)
                 if summary:
                     scid = self.index.store_content(
                         item["file_id"], "audio_summary", audio_ex.VERSION, summary
@@ -612,7 +613,7 @@ class Tier2Worker:
                 continue
             cap = " | ".join(s["captions"])
             scene_lines.append(
-                f"[{audio_ex._ts(s['start'])} - {audio_ex._ts(s['end'])}] {cap}"
+                f"[{format_ts(s['start'])} - {format_ts(s['end'])}] {cap}"
             )
             scene_chunks.append({"text": cap, "ts_start": s["start"], "ts_end": s["end"]})
         cid = self.index.store_content(
@@ -625,7 +626,7 @@ class Tier2Worker:
         if result["transcript"] and result["transcript"]["segments"]:
             self._store_transcript(file_id, result["transcript"])
 
-        summary = _strip_think(result["summary"])
+        summary = strip_think(result["summary"])
         if summary:
             scid = self.index.store_content(
                 file_id, "video_summary", video_ex.VERSION, summary
@@ -644,9 +645,3 @@ class Tier2Worker:
             return "defer_summary"
         return None
 
-
-def _strip_think(text: str) -> str:
-    """Remove qwen3 <think>...</think> blocks from model output."""
-    import re
-
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()

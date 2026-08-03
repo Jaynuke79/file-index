@@ -19,6 +19,7 @@ from pathlib import Path
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")  # AV_LOG_QUIET
 
 from ..ollama_client import OllamaClient
+from ..util import format_ts
 from . import audio as audio_ex
 
 log = logging.getLogger("file_index.extractors.video")
@@ -29,6 +30,7 @@ VERSION = "video-1.0"
 class VLMUnavailable(RuntimeError):
     """Every caption call for a video failed — the vision model is down, so
     the file must be retried rather than stored with empty captions."""
+
 
 CAPTION_PROMPT = (
     "Describe this video frame in 1-3 sentences: what is happening, who/what is "
@@ -281,7 +283,7 @@ def process_video(
                 log.warning("whisper failed for %s: %s", path, e)
 
     captions_text = "\n".join(
-        f"[{audio_ex._ts(s['start'])} - {audio_ex._ts(s['end'])}] " + " | ".join(s["captions"])
+        f"[{format_ts(s['start'])} - {format_ts(s['end'])}] " + " | ".join(s["captions"])
         for s in scene_results
         if s["captions"]
     ) or "(no captions available)"

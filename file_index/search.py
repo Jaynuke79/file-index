@@ -5,6 +5,9 @@ from __future__ import annotations
 from .config import Config
 from .embed import Embedder
 from .index import Index, SearchHit, merge_hits
+from .util import format_ts
+
+__all__ = ["format_ts", "hybrid_search"]
 
 
 def hybrid_search(
@@ -19,10 +22,3 @@ def hybrid_search(
             vec_hits = index.vector_search(emb, limit=limit * 2)
     return merge_hits(fts_hits, vec_hits, limit=limit)
 
-
-def format_ts(seconds: float | None) -> str:
-    if seconds is None:
-        return ""
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
