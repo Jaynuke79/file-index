@@ -78,6 +78,10 @@ class DeepConfig:
     # of frames already captioned in the same video — common in gameplay and
     # screen recordings.
     video_dedup_frames: bool = True
+    # Hamming distance between frame perceptual hashes below which a frame is
+    # considered a near-duplicate of one already captioned. Higher = more
+    # aggressive skipping (cheaper, coarser); 0 skips only identical frames.
+    video_dedup_distance: int = 6
     # When deep-processing a video, feed the captioner/summarizer the summaries
     # of up to this many already-indexed videos from the same folder, so a
     # folder of similar clips (same game, same people) is understood as such.
@@ -161,6 +165,7 @@ class Config:
                 "video_frame_workers": self.deep.video_frame_workers,
                 "video_max_scenes": self.deep.video_max_scenes,
                 "video_dedup_frames": self.deep.video_dedup_frames,
+                "video_dedup_distance": self.deep.video_dedup_distance,
                 "neighbor_context": self.deep.neighbor_context,
                 "defer_video_summaries": self.deep.defer_video_summaries,
             },
@@ -227,6 +232,7 @@ def load_config(path: Path | None = None) -> Config:
         video_frame_workers=int(d.get("video_frame_workers", cfg.deep.video_frame_workers)),
         video_max_scenes=int(d.get("video_max_scenes", cfg.deep.video_max_scenes)),
         video_dedup_frames=bool(d.get("video_dedup_frames", cfg.deep.video_dedup_frames)),
+        video_dedup_distance=int(d.get("video_dedup_distance", cfg.deep.video_dedup_distance)),
         neighbor_context=int(d.get("neighbor_context", cfg.deep.neighbor_context)),
         defer_video_summaries=bool(d.get("defer_video_summaries", cfg.deep.defer_video_summaries)),
     )

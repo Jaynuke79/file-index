@@ -196,6 +196,7 @@ def process_video(
     transcribe: bool = True,
     max_scenes: int = 0,
     dedup_frames: bool = False,
+    dedup_distance: int = DHASH_NEAR_DUPLICATE,
 ) -> dict:
     """Full pipeline. Returns:
     {scenes: [{start, end, captions: [str]}], transcript: {...}|None, summary: str}
@@ -212,7 +213,8 @@ def process_video(
     `transcribe=False` Whisper is skipped too (transcript=None); the worker
     runs `transcribe_video` on a background thread so the GPU can move on.
     `max_scenes` caps VLM work on scene-heavy videos; `dedup_frames` skips
-    frames that are near-duplicates of already-captioned ones.
+    frames within `dedup_distance` (perceptual-hash hamming distance) of one
+    already captioned in this video.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -276,7 +278,7 @@ def process_video(
                         if dedup_frames:
                             h = frame_dhash(frame)
                             if h is not None:
-                                if any(_hamming(h, s) <= DHASH_NEAR_DUPLICATE for s in seen_hashes):
+                                if any(_hamming(h, s) <= dedup_distance for s in seen_hashes):
                                     skipped_dups += 1
                                     continue
                                 seen_hashes.append(h)

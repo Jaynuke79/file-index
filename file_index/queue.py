@@ -664,6 +664,7 @@ class Tier2Worker:
             transcribe=not defer,
             max_scenes=self.config.deep.video_max_scenes,
             dedup_frames=self.config.deep.video_dedup_frames,
+            dedup_distance=self.config.deep.video_dedup_distance,
         )
         file_id = item["file_id"]
 
