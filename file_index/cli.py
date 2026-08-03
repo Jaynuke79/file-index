@@ -440,7 +440,14 @@ def browse(
     if not cfg.db_path.exists():
         console.print("[red]No index found — run `file-index scan` first.[/red]")
         raise typer.Exit(1)
-    from .web import serve
+    from .web import is_loopback, serve
+
+    if not is_loopback(host):
+        console.print(
+            f"[yellow]WARNING: binding to {host} exposes every indexed file "
+            "(original bytes, text, transcripts) unauthenticated to anyone "
+            "who can reach this address.[/yellow]"
+        )
 
     console.print(f"browse UI at [bold]http://{host}:{port}/[/bold] (ctrl-c to stop)")
     serve(cfg, host=host, port=port, open_browser=open_browser)
