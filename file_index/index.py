@@ -142,6 +142,15 @@ class Index:
         self.db.executescript(SCHEMA)
         self._vec_dim: int | None = None
         self._has_vec = self._try_load_sqlite_vec()
+        # The vec table may exist from an earlier process; deletions must
+        # clean it from the start of THIS process, not only after the first
+        # embedding insert sets _vec_dim (else replaced content leaves
+        # orphaned vectors whose rowids can be reused by later chunks).
+        self._vec_table = self._has_vec and bool(
+            self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_vec'"
+            ).fetchone()
+        )
 
     def _try_load_sqlite_vec(self) -> bool:
         try:
@@ -162,6 +171,7 @@ class Index:
             f"CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(embedding float[{dim}])"
         )
         self._vec_dim = dim
+        self._vec_table = True
 
     # ---------- files ----------
 
@@ -265,7 +275,7 @@ class Index:
 
     def _delete_content_row(self, content_id: int) -> None:
         self.db.execute("DELETE FROM content_fts WHERE rowid=?", (content_id,))
-        if self._has_vec and self._vec_dim:
+        if self._vec_table:
             for c in self.db.execute(
                 "SELECT id FROM chunks WHERE content_id=?", (content_id,)
             ):
