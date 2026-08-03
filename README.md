@@ -25,6 +25,20 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[deep,dev]"
 ```
 
+First run, end to end:
+
+```bash
+file-index init                 # pick roots, pull models
+file-index scan                 # minutes: text + metadata, search works after this
+file-index search "tax 2024"
+file-index deep                 # hours: images, audio, video (ctrl-c safe, resumable)
+file-index browse               # look at what it found
+```
+
+To keep the index current, run `file-index watch` or install the user unit in
+[`systemd/file-index-watch.service`](systemd/file-index-watch.service); `deep`
+stays manual so it never competes for the GPU unattended.
+
 ## Usage
 
 ```bash
@@ -51,10 +65,9 @@ near-instant (size+mtime short-circuit, content-hash verification on change).
 
 `deep` overlaps CPU and GPU work: while the GPU runs the current file's models,
 background threads prepare the next files (image transcode/downscale, video
-scene detection — `deep.prefetch_files`, default 2), and within a video, ffmpeg
+scene detection — `deep.prefetch_files`, default 4), and within a video, ffmpeg
 frame/audio extraction runs on `deep.video_frame_workers` threads (default 4)
-while the VLM captions. Whisper still runs after the VLM per file so both never
-compete for VRAM. Note that a stop may additionally wait for an in-flight
+while the VLM captions. Note that a stop may additionally wait for an in-flight
 prefetch (at most one scene detection) to finish.
 
 Whisper transcription runs on a background thread: after a video's captions
@@ -92,8 +105,10 @@ people/activities carry across clips.
 
 `~/.config/file-index/config.yaml` — created by `init`. Everything is swappable
 without code changes: model names, Ollama URL, roots, exclude globs, chunk
-sizes, tier-2 priority order (default: images before video, newest first),
-Whisper device/precision.
+sizes, tier-2 priority order (default: images, then audio, then video; newest
+first), Whisper device/precision. After changing a model name, run
+[`file-index reindex`](#architecture) so existing files are re-extracted with
+it.
 
 Data lives in `~/.local/share/file-index/` (`index.db`, logs, audit log,
 `thumbs/` cache for the browse UI).
@@ -104,6 +119,12 @@ video/audio summary on each card, full-text search over everything indexed,
 kind filters, and a detail view with the original media, OCR text, EXIF,
 transcripts, and scene lists. It opens the DB read-only, so it is safe to keep
 running while `scan`/`deep` work.
+
+On a loopback bind the server accepts only loopback `Host` headers and answers
+403 otherwise, so a website you visit cannot DNS-rebind to `127.0.0.1:8765` and
+read your index. `--host` beyond loopback disables that check (the machine's
+external names are unknowable) and serves every indexed file unauthenticated to
+anyone who can reach the address — `browse` prints a warning when you do it.
 
 ## Safety model
 
@@ -154,5 +175,17 @@ agent CLI ← search/organize tools ← index
 .venv/bin/pytest
 ```
 
-Covers crawler incremental logic (unchanged/modified/moved/deleted), chunking,
-queue kill/resume, tier-2 priority ordering, and VLM JSON validation (mocked model).
+127 tests, no GPU or network required — models, Whisper, and ffmpeg are mocked.
+
+- **Indexing**: crawler incremental logic (unchanged/modified/moved/deleted,
+  excludes, symlinks), chunking, queue kill/resume, tier-2 priority ordering,
+  duplicate reuse, and sqlite-vec cleanup on re-extraction.
+- **Deep pass**: VLM JSON validation and degradation, caption-failure retry,
+  scene sampling and frame dedup, CPU/GPU overlap, background transcription,
+  deferred summaries for video and audio, Whisper cache thread-safety, model
+  unloading.
+- **Safety**: the root whitelist across every agent tool (including `..`
+  traversal and symlinks leaving a root), `organize` plan filtering and
+  `--apply` guards, audit-log integrity, and `purge`.
+- **Interfaces**: the browse Store/HTTP endpoints (search, ranges, thumbnails,
+  Host validation), `reindex` version comparison and routing, and the watcher.
