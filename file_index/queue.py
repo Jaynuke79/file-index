@@ -634,7 +634,15 @@ class Tier2Worker:
                                  self.config.limits.chunk_overlap_tokens)
             self.index.store_chunks(file_id, scid, "video_summary",
                                     self.embedder.embed_chunks(schunks))
-        return "defer_transcript" if defer else None
+        if defer:
+            return "defer_transcript"
+        if not summary:
+            # Inline summarization failed (it is best-effort inside
+            # process_video). Captions and transcript are already stored, so
+            # hand the file to the end-of-run sweep rather than marking it
+            # done with no summary and never retrying.
+            return "defer_summary"
+        return None
 
 
 def _strip_think(text: str) -> str:
