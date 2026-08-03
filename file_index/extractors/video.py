@@ -25,6 +25,11 @@ log = logging.getLogger("file_index.extractors.video")
 
 VERSION = "video-1.0"
 
+
+class VLMUnavailable(RuntimeError):
+    """Every caption call for a video failed — the vision model is down, so
+    the file must be retried rather than stored with empty captions."""
+
 CAPTION_PROMPT = (
     "Describe this video frame in 1-3 sentences: what is happening, who/what is "
     "visible, any readable text. Be concrete and specific."
@@ -205,6 +210,7 @@ def process_video(
 
     scene_results = []
     skipped_dups = 0
+    caption_attempts = caption_failures = 0
     seen_hashes: list[int] = []
     with tempfile.TemporaryDirectory(prefix="file-index-video-") as tmp:
         tmpdir = Path(tmp)
@@ -240,10 +246,12 @@ def process_video(
                                 skipped_dups += 1
                                 continue
                             seen_hashes.append(h)
+                    caption_attempts += 1
                     try:
                         cap = client.generate(vision_model, caption_prompt, images=[frame])
                         captions.append(cap.strip())
                     except Exception as e:  # noqa: BLE001 — keep other scenes going
+                        caption_failures += 1
                         log.warning("caption failed scene %d of %s: %s", i, path, e)
                 scene_results.append(
                     {"start": round(start, 2), "end": round(end, 2), "captions": captions}
@@ -251,6 +259,14 @@ def process_video(
             wav = wav_future.result() if wav_future else None
         if skipped_dups:
             log.info("%s: skipped %d near-duplicate frames", path.name, skipped_dups)
+        # Every VLM call failing means the model/server is broken, not the
+        # video: raise so the queue retries this file later instead of
+        # storing empty captions and marking it done forever.
+        if caption_attempts and caption_failures == caption_attempts:
+            raise VLMUnavailable(
+                f"all {caption_attempts} caption calls failed for {path} — "
+                "vision model unavailable?"
+            )
 
         # Whisper on the audio track. Inline only when transcribe=True (the
         # deep worker instead runs transcribe_video on a background thread so
