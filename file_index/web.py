@@ -267,9 +267,26 @@ def _thumb_pdf(src: Path, out: Path) -> Path | None:
 # ---------- HTTP ----------
 
 
+def is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     store: Store
     thumb_dir: Path
+    # When set, requests whose Host header is not listed get 403. This is the
+    # standard DNS-rebinding defense for localhost servers: a malicious site
+    # rebinding its hostname to 127.0.0.1 sends its own domain as Host and can
+    # otherwise read the whole index cross-origin. None = no filtering (used
+    # for non-loopback binds, which are network-exposed by explicit choice).
+    allowed_hosts: set[str] | None = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args) -> None:  # route to logging, not stderr
@@ -303,6 +320,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _route(self) -> None:
+        if self.allowed_hosts is not None:
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host not in self.allowed_hosts:
+                return self._error(403, "forbidden Host header")
         url = urlparse(self.path)
         qs = parse_qs(url.query)
         parts = [p for p in url.path.split("/") if p]
@@ -415,6 +436,14 @@ def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765) -> Threa
     )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
+    if is_loopback(host):
+        actual_port = server.server_address[1]  # resolved when port=0
+        allowed = set()
+        for h in {"127.0.0.1", "localhost", "[::1]", host.lower()}:
+            allowed.add(f"{h}:{actual_port}")
+            if actual_port == 80:
+                allowed.add(h)
+        handler.allowed_hosts = allowed
     return server
 
 

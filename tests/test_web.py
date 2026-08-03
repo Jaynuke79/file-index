@@ -193,3 +193,80 @@ def test_browse_without_index_errors_and_creates_no_db(tmp_path, monkeypatch):
     assert result.exit_code == 1
     assert "scan" in result.output
     assert not cfg.db_path.exists()
+
+
+def test_host_header_validation_blocks_rebinding(server):
+    """A request whose Host header names a foreign domain (DNS rebinding)
+    must be rejected even though it reaches the loopback socket."""
+    import http.client
+
+    base, ids = server
+    port = int(base.rsplit(":", 1)[1])
+
+    def get_with_host(host_header):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("GET", "/api/summary", skip_host=True)
+        conn.putheader("Host", host_header)
+        conn.endheaders()
+        resp = conn.getresponse()
+        status, body = resp.status, resp.read()
+        conn.close()
+        return status, body
+
+    status, body = get_with_host("evil.example.com")
+    assert status == 403
+    assert b"api" not in body or b"kinds" not in body  # no data leaked
+
+    status, _ = get_with_host(f"attacker.net:{port}")
+    assert status == 403
+
+    # legitimate spellings still work
+    assert get_with_host(f"127.0.0.1:{port}")[0] == 200
+    assert get_with_host(f"localhost:{port}")[0] == 200
+
+
+def test_non_loopback_bind_skips_host_filtering(populated):
+    """Binding beyond loopback is an explicit exposure choice; Host filtering
+    can't enumerate the machine's names, so it is disabled (with a CLI warning)."""
+    import http.client
+
+    cfg, ids = populated
+    srv = make_server(cfg, host="0.0.0.0", port=0)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        port = srv.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("GET", "/api/summary", skip_host=True)
+        conn.putheader("Host", "some-lan-name.local")
+        conn.endheaders()
+        assert conn.getresponse().status == 200
+        conn.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_browse_warns_on_non_loopback_host(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from file_index import cli, web
+    from file_index.config import Config
+    from file_index.index import Index
+
+    cfg = Config()
+    cfg.roots = [tmp_path]
+    cfg.data_dir = tmp_path / "state"
+    cfg.data_dir.mkdir()
+    Index(cfg.db_path).close()  # index exists so browse proceeds
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    served = {}
+    monkeypatch.setattr(web, "serve", lambda *a, **k: served.setdefault("called", True))
+
+    result = CliRunner().invoke(cli.app, ["browse", "--host", "0.0.0.0", "--no-open"])
+    assert result.exit_code == 0
+    assert "WARNING" in result.output and "unauthenticated" in result.output
+    assert served.get("called")
+
+    result = CliRunner().invoke(cli.app, ["browse", "--no-open"])  # loopback: quiet
+    assert "WARNING" not in result.output
