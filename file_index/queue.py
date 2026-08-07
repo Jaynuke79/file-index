@@ -177,17 +177,49 @@ class Tier2Worker:
         ).fetchone()
         return row["n"]
 
+    def pending_units(self) -> int:
+        """Remaining work in pipeline steps rather than files: audio/video pass
+        through three stages (caption/prep, transcription, summary), everything
+        else one. Progress measured in these units keeps the bar's total stable
+        while files are deferred between stages instead of drifting upward."""
+        row = self.index.db.execute(
+            "SELECT COALESCE(SUM(CASE q.status"
+            "  WHEN 'pending_summary' THEN 1"
+            "  WHEN 'pending_transcript' THEN 2"
+            "  ELSE CASE COALESCE(NULLIF(q.kind, ''), f.kind)"
+            "    WHEN 'audio' THEN 3 WHEN 'video' THEN 3 ELSE 1 END"
+            "  END), 0) n "
+            "FROM queue q JOIN files f ON f.id = q.file_id WHERE q.tier=2 "
+            "AND q.status IN ('pending_deep', 'pending_transcript', 'pending_summary')"
+        ).fetchone()
+        return row["n"]
+
+    def _report_progress(self, progress_cb, path: Path, total_units: int,
+                         start_time: float) -> None:
+        """done/remaining in pipeline units, so done + remaining stays at the
+        run's starting total (it can only shrink, e.g. when a dedup hit or a
+        video with no audio track skips stages)."""
+        if not progress_cb:
+            return
+        elapsed = time.time() - start_time
+        remaining = self.pending_units()
+        done = max(0, total_units - remaining)
+        rate = done / elapsed if elapsed > 3 and done else None
+        eta = remaining / rate if rate else None
+        progress_cb(str(path), done, remaining, eta)
+
     def run(self, progress_cb=None, stop_check=None) -> dict:
         self.client.require()
         # Pin models in VRAM for the whole run: a long CPU stretch (Whisper,
         # scene detection) must not let Ollama idle-evict a ~20 GB model.
         # The CLI unloads everything when the run ends.
         self.client.keep_alive = -1
-        done = failed = 0
+        done = failed = 0  # files fully processed / permanently failed
         priority = list(self.config.deep.priority)
         if "pdf_scan" not in priority:
             priority.insert(0, "pdf_scan")
         start_time = time.time()
+        total_units = self.pending_units()
         prefetch_n = max(0, self.config.deep.prefetch_files)
         executor = (
             ThreadPoolExecutor(max_workers=prefetch_n, thread_name_prefix="prefetch")
@@ -217,12 +249,7 @@ class Tier2Worker:
                                           current_id=item["id"], depth=prefetch_n)
                 prep = self._take_prep(prefetched, item["id"])
                 path = Path(item["path"])
-                if progress_cb:
-                    elapsed = time.time() - start_time
-                    remaining = self.pending_count()
-                    rate = done / elapsed if elapsed > 3 and done else None
-                    eta = remaining / rate if rate else None
-                    progress_cb(str(path), done, remaining, eta)
+                self._report_progress(progress_cb, path, total_units, start_time)
                 try:
                     outcome = self._process(item, path, prep)
                     if outcome == "defer_transcript":
@@ -232,7 +259,7 @@ class Tier2Worker:
                     else:
                         self.index.mark_done(item["id"])
                         self.index.set_tier_status(item["file_id"], 2, "done")
-                    done += 1
+                        done += 1
                 except FileNotFoundError:
                     self.index.mark_failed(item["id"], "file disappeared during processing",
                                            self.config.limits.max_retries)
@@ -271,7 +298,9 @@ class Tier2Worker:
                     self._drain_transcripts(in_flight, wait=True)
         # All vision work is done — summarize every deferred video with the
         # agent model loaded once, instead of swapping models per video.
-        s_failed = self._summary_sweep(progress_cb, stop_check, done)
+        s_done, s_failed = self._summary_sweep(progress_cb, stop_check,
+                                               total_units, start_time)
+        done += s_done
         failed += s_failed
         return {"done": done, "failed": failed}
 
@@ -355,8 +384,9 @@ class Tier2Worker:
         self.index.store_chunks(file_id, tcid, stage,
                                 self.embedder.embed_chunks(tchunks))
 
-    def _summary_sweep(self, progress_cb, stop_check, done_so_far: int) -> int:
-        failed = 0
+    def _summary_sweep(self, progress_cb, stop_check, total_units: int,
+                       start_time: float) -> tuple[int, int]:
+        done = failed = 0
         while True:
             if stop_check and stop_check():
                 break
@@ -367,12 +397,12 @@ class Tier2Worker:
             if item is None:
                 break
             path = Path(item["path"])
-            if progress_cb:
-                progress_cb(str(path), done_so_far, self.pending_count(), None)
+            self._report_progress(progress_cb, path, total_units, start_time)
             try:
                 self._summarize_deferred(item, path)
                 self.index.mark_done(item["id"])
                 self.index.set_tier_status(item["file_id"], 2, "done")
+                done += 1
             except Exception as e:  # noqa: BLE001 — never let one file kill the sweep
                 log.exception("deferred summary failed on %s", path)
                 self.index.mark_failed(item["id"], f"{type(e).__name__}: {e}",
@@ -385,7 +415,7 @@ class Tier2Worker:
                     self.index.set_tier_status(item["file_id"], 2, "failed")
                     failed += 1
             self.index.commit()  # checkpoint after every summary
-        return failed
+        return done, failed
 
     def _summarize_deferred(self, item, path: Path) -> None:
         """Generate + store the summary for a file whose captions/transcript

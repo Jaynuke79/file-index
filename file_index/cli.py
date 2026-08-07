@@ -175,7 +175,12 @@ def deep() -> None:
     if not total:
         console.print("tier-2 queue is empty — nothing to do")
         return
-    console.print(f"{total} files queued for deep processing (ctrl-c safe: resumes where it left off)")
+    units = worker.pending_units()
+    steps = f", {units} pipeline steps" if units != total else ""
+    console.print(
+        f"{total} files queued for deep processing{steps} "
+        "(ctrl-c safe: resumes where it left off)"
+    )
 
     stop = {"flag": False}
 
@@ -197,10 +202,12 @@ def deep() -> None:
             TextColumn("{task.completed}/{task.total}"), TimeElapsedColumn(),
             console=console,
         ) as prog:
-            task = prog.add_task("deep", total=total)
+            task = prog.add_task("deep", total=units)
 
             def cb(path, done, remaining, eta):
                 eta_s = f" ETA {int(eta // 60)}m{int(eta % 60):02d}s" if eta else ""
+                # done/remaining are pipeline steps; the total only ever
+                # shrinks (a file skipping stages), never grows.
                 prog.update(task, completed=done, total=done + remaining,
                             description=f"{Path(path).name[:36]}{eta_s}")
 
