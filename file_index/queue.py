@@ -227,7 +227,10 @@ class Tier2Worker:
             else None
         )
         prefetched: dict[int, Future] = {}
-        transcriber = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcribe")
+        transcriber = ThreadPoolExecutor(
+            max_workers=max(1, self.config.deep.transcript_workers),
+            thread_name_prefix="transcribe",
+        )
         in_flight: dict[int, tuple[Future, dict]] = {}  # queue_id -> (future, item)
         try:
             while True:
@@ -308,7 +311,7 @@ class Tier2Worker:
         self,
         transcriber: ThreadPoolExecutor,
         in_flight: dict[int, tuple[Future, dict]],
-        max_in_flight: int = 2,
+        max_in_flight: int | None = None,
     ) -> None:
         """Feed the background transcription thread from pending_transcript
         rows (captions already stored, this run or an interrupted earlier one).
@@ -321,6 +324,9 @@ class Tier2Worker:
         from .extractors import audio as audio_ex
         from .extractors import video as video_ex
 
+        workers = max(1, self.config.deep.transcript_workers)
+        if max_in_flight is None:
+            max_in_flight = max(2, workers)
         if len(in_flight) >= max_in_flight:
             return
         rows = self.index.peek_pending(
@@ -342,6 +348,7 @@ class Tier2Worker:
             )
             fut = transcriber.submit(
                 fn, Path(it["path"]), self.config.models.whisper, "cpu", "int8",
+                workers,
             )
             in_flight[it["id"]] = (fut, it)
 
@@ -386,87 +393,127 @@ class Tier2Worker:
 
     def _summary_sweep(self, progress_cb, stop_check, total_units: int,
                        start_time: float) -> tuple[int, int]:
+        """Summarize every pending_summary item. Generation (pure model calls)
+        runs on `deep.summary_workers` threads; all DB reads/writes stay on
+        this thread, matching the transcript machinery."""
+        from concurrent.futures import FIRST_COMPLETED
+        from concurrent.futures import wait as futures_wait
+
         done = failed = 0
-        while True:
-            if stop_check and stop_check():
-                break
-            item = self.index.next_pending(
-                tier=2, status=PENDING_SUMMARY,
-                newest_first=self.config.deep.newest_first,
-            )
-            if item is None:
-                break
-            path = Path(item["path"])
-            self._report_progress(progress_cb, path, total_units, start_time)
-            try:
-                self._summarize_deferred(item, path)
-                self.index.mark_done(item["id"])
-                self.index.set_tier_status(item["file_id"], 2, "done")
-                done += 1
-            except Exception as e:  # noqa: BLE001 — never let one file kill the sweep
-                log.exception("deferred summary failed on %s", path)
-                self.index.mark_failed(item["id"], f"{type(e).__name__}: {e}",
-                                       self.config.limits.max_retries,
-                                       retry_status=PENDING_SUMMARY)
-                row = self.index.db.execute(
-                    "SELECT status FROM queue WHERE id=?", (item["id"],)
-                ).fetchone()
-                if row and row["status"] == "failed":
-                    self.index.set_tier_status(item["file_id"], 2, "failed")
-                    failed += 1
-            self.index.commit()  # checkpoint after every summary
+        workers = max(1, self.config.deep.summary_workers)
+        in_flight: dict[int, tuple[Future, dict, str]] = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="summary") as pool:
+            while True:
+                stopping = bool(stop_check and stop_check())
+                if not stopping:
+                    rows = self.index.peek_pending(
+                        tier=2, status=PENDING_SUMMARY,
+                        newest_first=self.config.deep.newest_first,
+                        limit=workers + len(in_flight),
+                    )
+                    for it in rows:
+                        if len(in_flight) >= workers:
+                            break
+                        if it["id"] in in_flight:
+                            continue
+                        path = Path(it["path"])
+                        try:
+                            ki = self._summary_inputs(it, path)
+                        except Exception as e:  # noqa: BLE001 — never let one file kill the sweep
+                            failed += self._summary_failed(it, e)
+                            continue
+                        if ki is None:  # silence / no speech: nothing to summarize
+                            self.index.mark_done(it["id"])
+                            self.index.set_tier_status(it["file_id"], 2, "done")
+                            done += 1
+                            self.index.commit()
+                            continue
+                        kind, inputs = ki
+                        fut = pool.submit(self._generate_summary, kind, inputs)
+                        in_flight[it["id"]] = (fut, it, kind)
+                if not in_flight:
+                    break
+                futures_wait([f for f, _, _ in in_flight.values()],
+                             return_when=FIRST_COMPLETED)
+                for qid in [q for q, (f, _, _) in in_flight.items() if f.done()]:
+                    fut, item, kind = in_flight.pop(qid)
+                    path = Path(item["path"])
+                    self._report_progress(progress_cb, path, total_units, start_time)
+                    try:
+                        self._store_summary(item["file_id"], kind, fut.result())
+                        self.index.mark_done(qid)
+                        self.index.set_tier_status(item["file_id"], 2, "done")
+                        done += 1
+                    except Exception as e:  # noqa: BLE001 — never let one file kill the sweep
+                        failed += self._summary_failed(item, e)
+                    self.index.commit()  # checkpoint after every summary
         return done, failed
+
+    def _summary_failed(self, item, e: Exception) -> int:
+        """Record a sweep failure; returns 1 when the item is permanently
+        failed (retries exhausted), else 0 (it went back to pending_summary)."""
+        log.exception("deferred summary failed on %s", item["path"])
+        self.index.mark_failed(item["id"], f"{type(e).__name__}: {e}",
+                               self.config.limits.max_retries,
+                               retry_status=PENDING_SUMMARY)
+        row = self.index.db.execute(
+            "SELECT status FROM queue WHERE id=?", (item["id"],)
+        ).fetchone()
+        self.index.commit()
+        if row and row["status"] == "failed":
+            self.index.set_tier_status(item["file_id"], 2, "failed")
+            return 1
+        return 0
 
     def _summarize_deferred(self, item, path: Path) -> None:
         """Generate + store the summary for a file whose captions/transcript
         were stored earlier in the run (or a previous, interrupted run)."""
-        from .extractors import video as video_ex
+        ki = self._summary_inputs(item, path)
+        if ki is None:
+            return  # silence / no speech: nothing to summarize
+        kind, inputs = ki
+        self._store_summary(item["file_id"], kind, self._generate_summary(kind, inputs))
 
+    def _summary_inputs(self, item, path: Path) -> tuple[str, dict] | None:
+        """DB reads for a deferred summary — main thread only. None when the
+        file has nothing to summarize (the item can be marked done as-is)."""
         file_id = item["file_id"]
         if _item_kind(item) == "audio":
-            return self._summarize_deferred_audio(item, path)
+            rows = self.index.get_content(file_id, "whisper")
+            transcript_text = (rows[0]["body"] if rows else "") or ""
+            if not transcript_text.strip():
+                return None
+            return "audio", {"prompt": AUDIO_SUMMARY_PROMPT + transcript_text[:30000]}
         scenes = self.index.get_content(file_id, "video_scenes")
         transcript = self.index.get_content(file_id, "video_transcript")
-        captions_text = (scenes[0]["body"] if scenes else "") or "(no captions available)"
-        transcript_text = (transcript[0]["body"] if transcript else "") or "(no speech / no audio track)"
-        summary = strip_think(video_ex.summarize_video(
-            self.client, self.config.models.agent, captions_text, transcript_text,
-            context=self._neighbor_context(file_id, path),
+        return "video", {
+            "captions": (scenes[0]["body"] if scenes else "") or "(no captions available)",
+            "transcript": (transcript[0]["body"] if transcript else "") or "(no speech / no audio track)",
+            "context": self._neighbor_context(file_id, path),
+        }
+
+    def _generate_summary(self, kind: str, inputs: dict) -> str:
+        """Pure model calls — safe on a worker thread."""
+        from .extractors import video as video_ex
+
+        if kind == "audio":
+            return strip_think(
+                self.client.generate(self.config.models.agent, inputs["prompt"]).strip()
+            )
+        return strip_think(video_ex.summarize_video(
+            self.client, self.config.models.agent,
+            inputs["captions"], inputs["transcript"], context=inputs["context"],
         ))
-        if summary:
-            scid = self.index.store_content(
-                file_id, "video_summary", self._version("video_summary"), summary
-            )
-            schunks = chunk_text(summary, self.config.limits.chunk_tokens,
-                                 self.config.limits.chunk_overlap_tokens)
-            self.index.store_chunks(file_id, scid, "video_summary",
-                                    self.embedder.embed_chunks(schunks))
 
-    def _summarize_deferred_audio(self, item, path: Path) -> None:
-        """Agent-model summary over an audio file's stored transcript. Runs in
-        the end-of-run sweep with the agent model loaded once, instead of
-        swapping it against the vision model per file."""
-        from .extractors import audio as audio_ex
-
-        file_id = item["file_id"]
-        rows = self.index.get_content(file_id, "whisper")
-        transcript_text = (rows[0]["body"] if rows else "") or ""
-        if not transcript_text.strip():
-            return  # silence / no speech: nothing to summarize
-        summary = strip_think(
-            self.client.generate(
-                self.config.models.agent,
-                AUDIO_SUMMARY_PROMPT + transcript_text[:30000],
-            ).strip()
-        )
-        if summary:
-            scid = self.index.store_content(
-                file_id, "audio_summary", self._version("audio_summary"), summary
-            )
-            schunks = chunk_text(summary, self.config.limits.chunk_tokens,
-                                 self.config.limits.chunk_overlap_tokens)
-            self.index.store_chunks(file_id, scid, "audio_summary",
-                                    self.embedder.embed_chunks(schunks))
+    def _store_summary(self, file_id: int, kind: str, summary: str) -> None:
+        """Store + embed a generated summary — main thread only."""
+        if not summary:
+            return
+        stage = SUMMARY_STAGE[kind]
+        cid = self.index.store_content(file_id, stage, self._version(stage), summary)
+        chunks = chunk_text(summary, self.config.limits.chunk_tokens,
+                            self.config.limits.chunk_overlap_tokens)
+        self.index.store_chunks(file_id, cid, stage, self.embedder.embed_chunks(chunks))
 
     def _top_up_prefetch(
         self,
@@ -695,6 +742,7 @@ class Tier2Worker:
             max_scenes=self.config.deep.video_max_scenes,
             dedup_frames=self.config.deep.video_dedup_frames,
             dedup_distance=self.config.deep.video_dedup_distance,
+            caption_workers=self.config.deep.video_caption_workers,
         )
         file_id = item["file_id"]
 

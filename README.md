@@ -111,6 +111,23 @@ already-captioned videos (32747 captions, 9.3/video):
 Lowering detail is safe to revisit later: bump the stage version or change the
 model and `file-index reindex` re-captions only the affected files.
 
+Beyond trimming work, the pipeline can overlap it. A single VLM request leaves
+the GPU idle during each image's CPU-side preprocessing, and single-stream
+decode never saturates a large GPU; `deep.video_caption_workers` (default 1)
+runs that many caption requests concurrently, and `deep.summary_workers`
+(default 1) does the same for the end-of-run summary sweep. Both only pay off
+when the Ollama server accepts parallel requests — set `OLLAMA_NUM_PARALLEL`
+to at least the larger of the two (for systemd: `sudo systemctl edit ollama`,
+add `Environment=` lines under `[Service]`, then restart). **Always pair it
+with `OLLAMA_CONTEXT_LENGTH`**: recent Ollama gives every parallel slot a 32k
+context by default, so `OLLAMA_NUM_PARALLEL=4` alone asks for 128k tokens of
+KV cache — tens of GB for a 32B vision model — silently spilling the model to
+CPU where every caption is ~30x slower and requests can 500. Captions need
+well under 8k tokens; `OLLAMA_NUM_PARALLEL=3` with `OLLAMA_CONTEXT_LENGTH=8192`
+(~6 GB of KV for qwen2.5vl:32b) is a sane pairing for a 32 GB GPU. `deep.transcript_workers` (default 2)
+background Whisper transcriptions run at once on CPU, sharing one set of model
+weights.
+
 When a video sits in a folder with already-summarized siblings, the captioner
 and summarizer get those summaries as background (`deep.neighbor_context`,
 default 3 siblings, 0 to disable) — so the 40th replay in your Smite folder is

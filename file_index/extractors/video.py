@@ -197,6 +197,7 @@ def process_video(
     max_scenes: int = 0,
     dedup_frames: bool = False,
     dedup_distance: int = DHASH_NEAR_DUPLICATE,
+    caption_workers: int = 1,
 ) -> dict:
     """Full pipeline. Returns:
     {scenes: [{start, end, captions: [str]}], transcript: {...}|None, summary: str}
@@ -214,7 +215,10 @@ def process_video(
     runs `transcribe_video` on a background thread so the GPU can move on.
     `max_scenes` caps VLM work on scene-heavy videos; `dedup_frames` skips
     frames within `dedup_distance` (perceptual-hash hamming distance) of one
-    already captioned in this video.
+    already captioned in this video. `caption_workers` VLM requests run
+    concurrently — worthwhile only when the Ollama server accepts parallel
+    requests (OLLAMA_NUM_PARALLEL), since one request leaves the GPU idle
+    during each image's CPU-side preprocessing.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -257,50 +261,67 @@ def process_video(
             # captioner is serialized on one GPU), but a stream ffmpeg cannot
             # decode is abandoned after one chunk instead of paying an
             # extraction for every scene — one real file logged 1508 of them.
-            chunk_size = max(4, frame_workers)
-            for base in range(0, len(scenes), chunk_size):
-                chunk = scenes[base : base + chunk_size]
-                chunk_futures = [
-                    [
-                        pool.submit(extract_frame, path, ts, tmpdir / f"s{base + i}_f{j}.jpg")
-                        for j, ts in enumerate(_offsets(start, end))
+            chunk_size = max(4, frame_workers, caption_workers)
+            cap_pool = ThreadPoolExecutor(
+                max_workers=max(1, caption_workers), thread_name_prefix="caption"
+            )
+            try:
+                for base in range(0, len(scenes), chunk_size):
+                    chunk = scenes[base : base + chunk_size]
+                    chunk_futures = [
+                        [
+                            pool.submit(extract_frame, path, ts, tmpdir / f"s{base + i}_f{j}.jpg")
+                            for j, ts in enumerate(_offsets(start, end))
+                        ]
+                        for i, (start, end) in enumerate(chunk)
                     ]
-                    for i, (start, end) in enumerate(chunk)
-                ]
-                for i, (start, end) in enumerate(chunk):
-                    captions = []
-                    for fut in chunk_futures[i]:
-                        frame = fut.result()
-                        if not frame:
-                            frames_failed += 1
-                            continue
-                        frames_decoded += 1
-                        if dedup_frames:
-                            h = frame_dhash(frame)
-                            if h is not None:
-                                if any(_hamming(h, s) <= dedup_distance for s in seen_hashes):
-                                    skipped_dups += 1
-                                    continue
-                                seen_hashes.append(h)
-                        caption_attempts += 1
-                        try:
-                            cap = client.generate(vision_model, caption_prompt, images=[frame])
-                            captions.append(cap.strip())
-                        except Exception as e:  # noqa: BLE001 — keep other scenes going
-                            caption_failures += 1
-                            log.warning("caption failed scene %d of %s: %s",
-                                        base + i, path, e)
-                    scene_results.append(
-                        {"start": round(start, 2), "end": round(end, 2), "captions": captions}
-                    )
-                if not frames_decoded and frames_failed >= FRAME_DECODE_GIVE_UP:
-                    remaining = len(scenes) - len(scene_results)
-                    if remaining:
-                        log.warning(
-                            "%s: no decodable frames after %d attempts — skipping the "
-                            "remaining %d scene(s)", path.name, frames_failed, remaining,
+                    # Resolve frames and dedup sequentially (so "already
+                    # captioned" keeps meaning frames dispatched before this
+                    # one), dispatch captions to cap_pool, then collect them in
+                    # scene order.
+                    dispatched: list[tuple] = []
+                    for i, (start, end) in enumerate(chunk):
+                        caption_futs = []
+                        for fut in chunk_futures[i]:
+                            frame = fut.result()
+                            if not frame:
+                                frames_failed += 1
+                                continue
+                            frames_decoded += 1
+                            if dedup_frames:
+                                h = frame_dhash(frame)
+                                if h is not None:
+                                    if any(_hamming(h, s) <= dedup_distance for s in seen_hashes):
+                                        skipped_dups += 1
+                                        continue
+                                    seen_hashes.append(h)
+                            caption_attempts += 1
+                            caption_futs.append(cap_pool.submit(
+                                client.generate, vision_model, caption_prompt, images=[frame]
+                            ))
+                        dispatched.append((start, end, caption_futs))
+                    for i, (start, end, caption_futs) in enumerate(dispatched):
+                        captions = []
+                        for fut in caption_futs:
+                            try:
+                                captions.append(fut.result().strip())
+                            except Exception as e:  # noqa: BLE001 — keep other scenes going
+                                caption_failures += 1
+                                log.warning("caption failed scene %d of %s: %s",
+                                            base + i, path, e)
+                        scene_results.append(
+                            {"start": round(start, 2), "end": round(end, 2), "captions": captions}
                         )
-                    break
+                    if not frames_decoded and frames_failed >= FRAME_DECODE_GIVE_UP:
+                        remaining = len(scenes) - len(scene_results)
+                        if remaining:
+                            log.warning(
+                                "%s: no decodable frames after %d attempts — skipping the "
+                                "remaining %d scene(s)", path.name, frames_failed, remaining,
+                            )
+                        break
+            finally:
+                cap_pool.shutdown(wait=True, cancel_futures=True)
             wav = wav_future.result() if wav_future else None
         if skipped_dups:
             log.info("%s: skipped %d near-duplicate frames", path.name, skipped_dups)
@@ -363,6 +384,7 @@ def transcribe_video(
     whisper_model: str = "large-v3",
     whisper_device: str = "cuda",
     whisper_compute_type: str = "float16",
+    num_workers: int = 1,
 ) -> dict | None:
     """Extract the audio track and Whisper-transcribe it. None when the video
     has no audio. Runs standalone (own temp dir) so the deep worker can call it
@@ -372,7 +394,7 @@ def transcribe_video(
         if not wav:
             return None
         return audio_ex.transcribe(
-            wav, whisper_model, whisper_device, whisper_compute_type
+            wav, whisper_model, whisper_device, whisper_compute_type, num_workers
         )
 
 
