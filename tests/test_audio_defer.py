@@ -55,7 +55,7 @@ def test_background_transcription_uses_cpu_and_stores_whisper_stage(audio_item, 
 
     calls = []
 
-    def fake_transcribe(p, model, device, compute):
+    def fake_transcribe(p, model, device, compute, num_workers=1):
         calls.append((Path(p).name, device, compute))
         return TRANSCRIPT
 

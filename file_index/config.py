@@ -94,6 +94,16 @@ class DeepConfig:
     # well as video (the name predates audio joining the same pipeline);
     # disabling it restores fully inline per-file processing.
     defer_video_summaries: bool = True
+    # Concurrent VLM caption requests per video. Values > 1 only pay off when
+    # the Ollama server allows parallel requests (OLLAMA_NUM_PARALLEL >= this);
+    # otherwise the extra requests just queue server-side, which is harmless.
+    video_caption_workers: int = 1
+    # Background Whisper transcriptions running at once. Each active job uses
+    # a few CPU cores; the model weights are shared between them.
+    transcript_workers: int = 2
+    # Concurrent agent-model summary generations in the end-of-run sweep.
+    # Same OLLAMA_NUM_PARALLEL caveat as video_caption_workers.
+    summary_workers: int = 1
 
 
 @dataclass

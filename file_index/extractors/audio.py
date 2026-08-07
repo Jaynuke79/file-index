@@ -23,8 +23,8 @@ _models: dict[tuple, object] = {}
 _models_lock = threading.Lock()
 
 
-def _get_model(name: str, device: str, compute_type: str):
-    key = (name, device, compute_type)
+def _get_model(name: str, device: str, compute_type: str, num_workers: int = 1):
+    key = (name, device, compute_type, num_workers)
     with _models_lock:
         model = _models.get(key)
         if model is None:
@@ -32,11 +32,13 @@ def _get_model(name: str, device: str, compute_type: str):
 
             log.info("loading faster-whisper %s on %s (%s)", name, device, compute_type)
             try:
-                model = WhisperModel(name, device=device, compute_type=compute_type)
+                model = WhisperModel(name, device=device, compute_type=compute_type,
+                                     num_workers=num_workers)
             except Exception as e:  # noqa: BLE001 — fall back to CPU if CUDA is broken
                 if device != "cpu":
                     log.warning("whisper on %s failed (%s); falling back to cpu int8", device, e)
-                    model = WhisperModel(name, device="cpu", compute_type="int8")
+                    model = WhisperModel(name, device="cpu", compute_type="int8",
+                                         num_workers=num_workers)
                 else:
                     raise
             # A fallback is cached under the requested key on purpose: repeated
@@ -50,9 +52,14 @@ def transcribe(
     model_name: str = "large-v3",
     device: str = "cuda",
     compute_type: str = "float16",
+    num_workers: int = 1,
 ) -> dict:
-    """Returns {language, duration, segments: [{start, end, text}], text}."""
-    model = _get_model(model_name, device, compute_type)
+    """Returns {language, duration, segments: [{start, end, text}], text}.
+
+    `num_workers` > 1 lets concurrent transcribe() calls from different
+    threads actually run in parallel (ctranslate2 workers share the model
+    weights); with 1 they serialize on the single worker."""
+    model = _get_model(model_name, device, compute_type, num_workers)
     segments_iter, info = model.transcribe(str(path), vad_filter=True)
     segments = [
         {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}

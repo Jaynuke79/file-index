@@ -19,7 +19,7 @@ class FakeWhisperModel:
     instances: list["FakeWhisperModel"] = []
     lock = threading.Lock()
 
-    def __init__(self, name, device=None, compute_type=None):
+    def __init__(self, name, device=None, compute_type=None, num_workers=1):
         import time
 
         time.sleep(0.01)  # widen the check-then-set window
@@ -70,7 +70,7 @@ def test_cuda_failure_falls_back_to_cpu_and_is_cached(monkeypatch):
     calls = []
 
     class Flaky:
-        def __init__(self, name, device=None, compute_type=None):
+        def __init__(self, name, device=None, compute_type=None, num_workers=1):
             calls.append((name, device, compute_type))
             if device == "cuda":
                 raise RuntimeError("no CUDA")

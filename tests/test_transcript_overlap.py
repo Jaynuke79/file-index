@@ -51,7 +51,7 @@ def test_transcription_runs_in_background_and_stores(tmp_env, monkeypatch):
     monkeypatch.setattr(video_ex, "process_video", fake_process_video)
     devices = []
 
-    def fake_transcribe(path, model, device, compute):
+    def fake_transcribe(path, model, device, compute, num_workers=1):
         devices.append(device)
         return {"language": "en", "duration": 5.0,
                 "segments": [{"start": 0.0, "end": 2.0,
