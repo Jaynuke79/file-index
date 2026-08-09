@@ -131,6 +131,43 @@ def test_delete_candidates_are_kept_but_never_executable(tools, monkeypatch):
     assert doable == []
 
 
+def test_propose_organization_requests_agent_context(tools, monkeypatch):
+    """Agent calls must ask for their own num_ctx: the server default is sized
+    for captioning (OLLAMA_CONTEXT_LENGTH) and organize prompts overflow it."""
+    t, cfg, index, root = tools
+    client = _plan_with([], monkeypatch, root)
+    propose_organization(cfg, index, root)
+    assert client.generate.call_args.kwargs["options"] == {
+        "num_ctx": cfg.models.agent_num_ctx
+    }
+
+
+def test_propose_organization_empty_response_says_why(tools, monkeypatch):
+    t, cfg, index, root = tools
+    client = _plan_with([], monkeypatch, root)
+    client.generate.return_value = ""
+    with pytest.raises(ValueError, match="context window"):
+        propose_organization(cfg, index, root)
+
+
+def test_propose_organization_disables_thinking_with_json_grammar(tools, monkeypatch):
+    """format=json + a thinking model yields an empty string (the grammar
+    blocks the <think> preamble) — the call must send think=False, and fall
+    back to an unconstrained retry if that still comes back empty."""
+    t, cfg, index, root = tools
+    client = _plan_with([], monkeypatch, root)
+
+    def fake_generate(model, prompt, format_json=False, think=None, **kw):
+        if format_json and think is not False:
+            return ""  # grammar-blocked thinking model
+        return json.dumps({"summary": "ok", "actions": []})
+
+    client.generate.side_effect = fake_generate
+    plan = propose_organization(cfg, index, root)
+    assert plan.summary == "ok"
+    assert client.generate.call_args.kwargs["think"] is False
+
+
 # ---------- organize --apply guards ----------
 
 

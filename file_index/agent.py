@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import requests
+
 from .config import Config
 from .index import Index
 from .ollama_client import OllamaClient
@@ -193,7 +195,8 @@ def ask(config: Config, index: Index, question: str, on_tool=None) -> str:
         {"role": "user", "content": question},
     ]
     for _ in range(MAX_AGENT_TURNS):
-        msg = client.chat(config.models.agent, messages, tools=TOOLS)
+        msg = client.chat(config.models.agent, messages, tools=TOOLS,
+                          options={"num_ctx": config.models.agent_num_ctx})
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         if not calls:
@@ -277,12 +280,30 @@ def propose_organization(config: Config, index: Index, directory: Path) -> Organ
         f"Directory to organize: {directory}\n\nListing:\n{listing}\n\n"
         f"Indexed content hints:\n" + "\n".join(hints[:200])
     )
-    raw = client.generate(
-        config.models.agent,
-        ORGANIZE_SYSTEM + "\n\n" + prompt + "\n\nReturn only the JSON object. /no_think",
-        format_json=True,
-    )
+    def _gen(**extra):
+        return client.generate(
+            config.models.agent,
+            ORGANIZE_SYSTEM + "\n\n" + prompt + "\n\nReturn only the JSON object. /no_think",
+            options={"num_ctx": config.models.agent_num_ctx},
+            **extra,
+        )
+
+    try:
+        raw = _gen(format_json=True, think=False)
+    except requests.HTTPError:
+        # agent model doesn't accept the think parameter
+        raw = _gen(format_json=True)
+    if not strip_think(raw).strip():
+        # a thinking model whose grammar-blocked output came back empty:
+        # retry unconstrained and rely on the {...} extraction below
+        raw = _gen()
     raw = strip_think(raw)
+    if not raw.strip():
+        raise ValueError(
+            "agent returned an empty response — usually the prompt overflowed the "
+            "model's context window; raise models.agent_num_ctx in config.yaml "
+            "(or organize a smaller directory)"
+        )
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1:
         raise ValueError(f"agent did not return JSON:\n{raw[:500]}")

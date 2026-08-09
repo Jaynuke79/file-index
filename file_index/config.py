@@ -44,6 +44,11 @@ class ModelsConfig:
     embed: str = "nomic-embed-text"
     whisper: str = "large-v3"  # faster-whisper model name, not Ollama
     ollama_url: str = "http://localhost:11434"
+    # Context window requested for agent calls (ask/organize). Their prompts
+    # carry directory listings, content hints, and tool results, which
+    # overflow a caption-sized server default (OLLAMA_CONTEXT_LENGTH) — an
+    # overflowed prompt makes the model return an empty response.
+    agent_num_ctx: int = 32768
 
 
 @dataclass
