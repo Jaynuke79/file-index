@@ -123,8 +123,16 @@ class OllamaClient:
         images: list[Path] | None = None,
         format_json: bool = False,
         options: dict | None = None,
+        think: bool | None = None,
     ) -> str:
+        """`think=False` matters when combined with format_json on a thinking
+        model (qwen3): the JSON grammar blocks the <think> preamble the
+        template opens with, and generation dies producing an empty string.
+        Models without thinking support reject the parameter (HTTP 400), so
+        it is only sent when explicitly set."""
         payload: dict = {"model": model, "prompt": prompt, "stream": False}
+        if think is not None:
+            payload["think"] = think
         if self.keep_alive is not None:
             payload["keep_alive"] = self.keep_alive
         if images:
