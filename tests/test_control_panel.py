@@ -214,6 +214,26 @@ def test_post_without_csrf_is_refused(server, tmp_path):
     assert load_config(cfg.config_path).roots == cfg.roots  # unchanged
 
 
+def test_prewarm_status_and_stop(server):
+    base, handler, cfg = server
+
+    status, body = _req(f"{base}/api/prewarm")
+    assert status == 200
+    assert body == {"active": False, "stopping": False,
+                    "total": 0, "done": 0, "built": 0, "current": ""}
+
+    # stop is a write: CSRF-gated like every other POST
+    status, body = _req(f"{base}/api/prewarm/stop", "POST", {},
+                        {"Content-Type": "application/json"})
+    assert status == 403
+
+    status, body = _req(f"{base}/api/prewarm/stop", "POST", {},
+                        {"Content-Type": "application/json",
+                         "X-CSRF-Token": handler.csrf_token})
+    assert status == 200
+    assert handler.prewarm_stop.is_set()  # pre-warm thread will exit at next check
+
+
 def test_post_with_csrf_succeeds(server, tmp_path):
     base, handler, cfg = server
     newdir = tmp_path / "extra"

@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import threading
+import time
 import urllib.request
 
 import pytest
@@ -241,6 +242,124 @@ def test_http_media_transcodes_mov_to_mp4(previews):
     status, headers, _ = _get(f"{base}/media/{ids['mov']}", {"Range": "bytes=0-9"})
     assert status == 206
     assert headers["Content-Range"] == f"bytes 0-9/{cached[0].stat().st_size}"
+
+
+@pytestmark_ffmpeg
+def test_preview_status_polls_pending_then_ready(previews):
+    """api/preview kicks off a background transcode and reports progress; a
+    media request after "ready" is served straight from the cache."""
+    base, ids, cfg = previews
+    status, _, body = _get(f"{base}/api/preview/{ids['mov']}")
+    assert status == 200
+    first = json.loads(body)["status"]
+    assert first in ("pending", "ready")  # tiny clip may finish very fast
+
+    deadline = time.monotonic() + 60
+    st = first
+    while st == "pending" and time.monotonic() < deadline:
+        time.sleep(0.2)
+        _, _, body = _get(f"{base}/api/preview/{ids['mov']}")
+        st = json.loads(body)["status"]
+    assert st == "ready"
+    assert list((cfg.data_dir / "previews").glob("*.mp4"))
+
+    status, headers, _ = _get(f"{base}/media/{ids['mov']}")
+    assert status == 200 and headers["Content-Type"] == "video/mp4"
+
+
+def test_preview_status_unknown_id_404(previews):
+    base, ids, cfg = previews
+    status, _, _ = _get(f"{base}/api/preview/999999")
+    assert status == 404
+
+
+def test_preview_path_native_formats_need_no_preview(tmp_path):
+    from file_index.web import preview_path
+
+    native = tmp_path / "a.mp4"
+    native.write_bytes(b"x")
+    assert preview_path(tmp_path, 1, native) is None
+    mov = tmp_path / "b.mov"
+    mov.write_bytes(b"x")
+    assert preview_path(tmp_path, 2, mov) == tmp_path / f"2-{int(mov.stat().st_mtime)}.mp4"
+
+
+def test_preview_manager_builds_once_across_threads(tmp_path, monkeypatch):
+    """Concurrent ensure() calls for one key run a single build; the rest wait
+    for it and return the same cached result."""
+    from file_index import web
+
+    calls = []
+
+    def fake_make_preview(src, out):
+        calls.append(src)
+        time.sleep(0.2)
+        out.write_bytes(b"x")
+        return out
+
+    monkeypatch.setattr(web, "_make_preview", fake_make_preview)
+    mgr = web.PreviewManager()
+    src, out = tmp_path / "a.mov", tmp_path / "1-100.mp4"
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(mgr.ensure(src, out)))
+        for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(calls) == 1
+    assert results == [out] * 4
+
+
+def test_preview_manager_remembers_failure(tmp_path, monkeypatch):
+    from file_index import web
+
+    monkeypatch.setattr(web, "_make_preview", lambda src, out: None)
+    mgr = web.PreviewManager()
+    src, out = tmp_path / "a.mov", tmp_path / "1-100.mp4"
+    assert mgr.ensure(src, out) is None
+    assert mgr.status_and_kick(src, out) == "failed"  # no retry loop
+
+
+@pytestmark_ffmpeg
+def test_prewarm_builds_previews_without_requests(tmp_env):
+    """A server started with prewarm=True transcodes .mov previews in the
+    background before anyone opens the file."""
+    cfg, index, root = tmp_env
+
+    mov_path = root / "clip.mov"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+         "-i", "testsrc=size=64x48:rate=10:duration=1",
+         "-pix_fmt", "yuv420p", str(mov_path)],
+        check=True, capture_output=True, timeout=120,
+    )
+    index.upsert_file(
+        str(mov_path), "h1", mov_path.stat().st_size, 100.0, "video/quicktime", "video"
+    )
+    index.commit()
+
+    srv = make_server(cfg, host="127.0.0.1", port=0, prewarm=True)
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if list((cfg.data_dir / "previews").glob("*.mp4")):
+                break
+            time.sleep(0.2)
+        assert list((cfg.data_dir / "previews").glob("*.mp4"))
+        # progress is reported for the control panel
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            st = srv.RequestHandlerClass.prewarm_state.snapshot()
+            if not st["active"]:
+                break
+            time.sleep(0.1)
+        assert st["total"] == 1 and st["done"] == 1 and st["built"] == 1
+    finally:
+        srv.prewarm_stop.set()
+        srv.server_close()
 
 
 def test_prune_previews_removes_only_stale_entries(tmp_path):

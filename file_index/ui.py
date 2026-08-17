@@ -110,6 +110,9 @@ pre.out { background: #0c0c10; border: 1px solid var(--border); border-radius: 8
   justify-content: center; min-width: 0; }
 #m-media img, #m-media video { max-width: 100%; max-height: 92vh; object-fit: contain; }
 #m-media .ph { font-size: 80px; opacity: .4; }
+#m-media .prep { color: var(--dim); font-size: 14px; margin-top: 10px;
+  animation: prep-pulse 1.4s ease-in-out infinite; }
+@keyframes prep-pulse { 50% { opacity: .35; } }
 #m-side { flex: 1; min-width: 320px; max-width: 460px; overflow-y: auto; padding: 18px; }
 #m-side h2 { font-size: 15px; word-break: break-all; margin-bottom: 4px; }
 #m-side .path { color: var(--dim); font-size: 12px; word-break: break-all;
@@ -248,7 +251,7 @@ function show(id) {
   }
   document.querySelector("label.cap").style.display = id === "library" ? "" : "none";
   if (poll) { clearInterval(poll); poll = null; }
-  if (id === "settings") renderSettings();
+  if (id === "settings") { renderSettings(); poll = setInterval(refreshPrewarm, 2000); }
   if (id === "jobs") { renderJobs(); poll = setInterval(renderJobs, 1500); }
   if (id === "status") { renderStatus(); poll = setInterval(renderStatus, 5000); }
   location.hash = id;
@@ -358,6 +361,54 @@ async function renderSettings() {
     "video_frames_per_scene or raise video_dedup_distance to trade detail for speed.",
     "deep", s.deep, s.editable.deep));
   body.appendChild(sectionForm("Limits", "Crawl and chunking caps.", "limits", s.limits, s.editable.limits));
+
+  // video preview pre-warm
+  const pw = panel("Video previews",
+    "Background transcode of phone videos (.mov) into browser-playable previews, " +
+    "so first views are instant. Runs at browse startup and as the last step of " +
+    "`deep`. Stopping is safe: it resumes on the next browse or deep run.");
+  const row = el("div", "row");
+  const line = el("span", "grow", "…");
+  line.id = "prewarm-line";
+  row.appendChild(line);
+  if (WRITABLE) {
+    const b = el("button", "act danger", "Stop pre-warming");
+    b.id = "prewarm-stop";
+    b.disabled = true;
+    b.onclick = async () => {
+      try {
+        await post("api/prewarm/stop");
+        toast("Pre-warming stops after the current video");
+        refreshPrewarm();
+      } catch (e) { toast(e.message, true); }
+    };
+    row.appendChild(b);
+  }
+  pw.appendChild(row);
+  body.appendChild(pw);
+  refreshPrewarm();
+}
+
+function prewarmText(st) {
+  if (st.active) {
+    const cur = st.current ? " — " + st.current : "";
+    return (st.stopping ? "stopping after current video… " : "transcoding ") +
+      st.done + "/" + st.total + cur;
+  }
+  if (st.total && st.done >= st.total) return "finished: " + st.built + "/" + st.total + " built this run";
+  if (st.total) return "stopped at " + st.done + "/" + st.total + " — restart browse (or run deep) to resume";
+  return "idle — no previews missing, or pre-warm disabled";
+}
+
+async function refreshPrewarm() {
+  const line = $("prewarm-line");
+  if (!line) return;
+  try {
+    const st = await getJSON("api/prewarm");
+    line.textContent = prewarmText(st);
+    const btn = $("prewarm-stop");
+    if (btn) btn.disabled = !st.active || st.stopping;
+  } catch { /* transient — next poll retries */ }
 }
 
 function sectionForm(title, hint, section, values, editable) {
@@ -655,15 +706,17 @@ function section(title, contentEl) {
   return s;
 }
 
+let modalSeq = 0;  // invalidates in-flight preview polling on close/switch
+
 async function openModal(id) {
+  const seq = ++modalSeq;
   const d = await (await fetch("api/file/" + id)).json();
   const media = $("m-media"), side = $("m-side");
   media.textContent = ""; side.textContent = "";
   if (d.kind === "image") {
     const img = el("img"); img.src = "media/" + d.id; media.appendChild(img);
   } else if (d.kind === "video") {
-    const v = el("video"); v.controls = true; v.src = "media/" + d.id;
-    media.appendChild(v);
+    showVideo(d.id, media, seq);
   } else if (d.kind === "audio") {
     const a = el("audio"); a.controls = true; a.src = "media/" + d.id;
     media.appendChild(a);
@@ -682,6 +735,40 @@ async function openModal(id) {
   if (d.error) side.appendChild(section("Processing error", el("p", "", d.error)));
   for (const c of d.content) side.appendChild(renderStage(c));
   $("overlay").classList.add("open");
+}
+
+// Phone .mov files are transcoded server-side on first view (HEVC — browsers
+// can't play it). Poll api/preview until the cache is ready instead of
+// pointing <video> at a request that blocks for the whole transcode.
+async function showVideo(id, media, seq) {
+  const poll = async () => {
+    try { return await (await fetch("api/preview/" + id)).json(); }
+    catch { return { status: "failed" }; }
+  };
+  let st = await poll();
+  if (st.status === "pending") {
+    media.appendChild(el("span", "ph", ICONS.video));
+    media.appendChild(el("div", "prep", "preparing video preview…"));
+    while (st.status === "pending" && seq === modalSeq) {
+      await new Promise((r) => setTimeout(r, 2000));
+      st = await poll();
+    }
+  }
+  if (seq !== modalSeq) return;  // modal closed or another file opened
+  media.textContent = "";
+  if (st.status !== "ready") {
+    media.appendChild(el("span", "ph", "⚠"));
+    media.appendChild(el("div", "prep", "video preview failed — see the browse log"));
+    return;
+  }
+  const v = el("video"); v.controls = true;
+  v.onerror = () => {
+    media.textContent = "";
+    media.appendChild(el("span", "ph", "⚠"));
+    media.appendChild(el("div", "prep", "video failed to load"));
+  };
+  v.src = "media/" + id;
+  media.appendChild(v);
 }
 
 function renderStage(c) {
@@ -717,6 +804,7 @@ function renderStage(c) {
 }
 
 function closeModal() {
+  modalSeq++;  // halt any preview polling for the closed file
   $("overlay").classList.remove("open");
   $("m-media").textContent = "";  // stop any playing video
 }

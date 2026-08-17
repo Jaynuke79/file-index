@@ -170,18 +170,6 @@ def deep() -> None:
     cfg, index = _load()
     from .queue import Tier2Worker
 
-    worker = Tier2Worker(cfg, index)
-    total = worker.pending_count()
-    if not total:
-        console.print("tier-2 queue is empty — nothing to do")
-        return
-    units = worker.pending_units()
-    steps = f", {units} pipeline steps" if units != total else ""
-    console.print(
-        f"{total} files queued for deep processing{steps} "
-        "(ctrl-c safe: resumes where it left off)"
-    )
-
     stop = {"flag": False}
 
     def on_stop_signal(sig, frame):
@@ -194,6 +182,19 @@ def deep() -> None:
 
     signal.signal(signal.SIGINT, on_stop_signal)
     signal.signal(signal.SIGTERM, on_stop_signal)
+
+    worker = Tier2Worker(cfg, index)
+    total = worker.pending_count()
+    if not total:
+        console.print("tier-2 queue is empty")
+        _prewarm_previews_step(cfg, stop)
+        return
+    units = worker.pending_units()
+    steps = f", {units} pipeline steps" if units != total else ""
+    console.print(
+        f"{total} files queued for deep processing{steps} "
+        "(ctrl-c safe: resumes where it left off)"
+    )
 
     result = None
     try:
@@ -226,6 +227,45 @@ def deep() -> None:
             f"tier 2: [green]{result['done']} processed[/green], [red]{result['failed']} failed[/red], "
             f"{worker.pending_count()} remaining"
         )
+    if not stop["flag"]:
+        _prewarm_previews_step(cfg, stop)
+
+
+def _prewarm_previews_step(cfg, stop: dict) -> None:
+    """Last deep step: transcode browser previews for videos (the same work
+    the browse server pre-warms in the background) so first views in the web
+    UI are instant. Cached results make it resumable and near-instant when
+    everything is already built."""
+    from .web import PreviewManager, Store, kill_active_transcodes, missing_previews
+
+    todo = missing_previews(Store(cfg.db_path), cfg.data_dir / "previews")
+    if not todo:
+        return
+    console.print(
+        f"{len(todo)} browse video preview(s) to build (ctrl-c safe: resumes where it left off)"
+    )
+    mgr = PreviewManager()
+    built = 0
+    try:
+        with Progress(
+            SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
+            TextColumn("{task.completed}/{task.total}"), TimeElapsedColumn(),
+            console=console,
+        ) as prog:
+            task = prog.add_task("previews", total=len(todo))
+            for src, out in todo:
+                if stop["flag"]:
+                    break
+                prog.update(task, description=src.name[:36])
+                if mgr.ensure(src, out) is not None:
+                    built += 1
+                prog.update(task, advance=1)
+    finally:
+        kill_active_transcodes()  # a second signal must not orphan an ffmpeg
+    rest = len(todo) - built
+    console.print(
+        f"previews: [green]{built} built[/green]" + (f", {rest} remaining/failed" if rest else "")
+    )
 
 
 @app.command()
@@ -547,6 +587,11 @@ def browse(
     open_browser: bool = typer.Option(
         True, "--open/--no-open", help="Open the UI in the default browser."
     ),
+    prewarm: bool = typer.Option(
+        True, "--prewarm/--no-prewarm",
+        help="Transcode missing video previews in the background so first "
+        "views are instant (CPU-heavy until the backlog is done; resumable).",
+    ),
 ) -> None:
     """Serve a local web gallery of indexed files and their captions."""
     try:
@@ -570,7 +615,7 @@ def browse(
         )
 
     console.print(f"browse UI at [bold]http://{host}:{port}/[/bold] (ctrl-c to stop)")
-    serve(cfg, host=host, port=port, open_browser=open_browser)
+    serve(cfg, host=host, port=port, open_browser=open_browser, prewarm=prewarm)
 
 
 @app.command()

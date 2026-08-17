@@ -13,6 +13,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -361,6 +362,23 @@ def _preview_image(src: Path, out: Path) -> Path | None:
         return _save_jpeg(img, out, quality=92)
 
 
+# Backstop only: veryfast x264 runs well above realtime, so this covers even
+# multi-hour footage; a transcode that genuinely takes longer is stuck.
+PREVIEW_TRANSCODE_TIMEOUT = 4 * 3600
+
+# In-flight ffmpeg preview processes, so shutdown can kill them — an orphaned
+# transcode keeps saturating every core long after browse exits.
+_transcode_mu = threading.Lock()
+_active_transcodes: set = set()
+
+
+def kill_active_transcodes() -> None:
+    with _transcode_mu:
+        procs = list(_active_transcodes)
+    for p in procs:
+        p.kill()
+
+
 def _preview_video(src: Path, out: Path) -> Path | None:
     """H.264/AAC MP4 for video that browsers won't play in <video> — .mov
     from phones is commonly HEVC, which Chrome/Firefox can't decode."""
@@ -368,18 +386,164 @@ def _preview_video(src: Path, out: Path) -> Path | None:
 
     tmp = out.with_name(f"{out.name}.{os.getpid()}.{threading.get_ident()}.tmp.mp4")
     try:
-        subprocess.run(
+        proc = subprocess.Popen(
             ["ffmpeg", "-y", "-v", "error", "-i", str(src),
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
              "-c:a", "aac", "-movflags", "+faststart", str(tmp)],
-            capture_output=True, timeout=600, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-    except (subprocess.SubprocessError, OSError) as e:
+    except OSError as e:
         log.warning("preview transcode failed for %s: %s", src, e)
+        return None
+    with _transcode_mu:
+        _active_transcodes.add(proc)
+    try:
+        _, err = proc.communicate(timeout=PREVIEW_TRANSCODE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        log.warning("preview transcode timed out for %s", src)
+        tmp.unlink(missing_ok=True)
+        return None
+    finally:
+        with _transcode_mu:
+            _active_transcodes.discard(proc)
+    if proc.returncode != 0:
+        log.warning(
+            "preview transcode failed for %s: %s",
+            src, err.decode(errors="replace").strip() or f"ffmpeg exit {proc.returncode}",
+        )
         tmp.unlink(missing_ok=True)
         return None
     os.replace(tmp, out)
     return out
+
+
+def preview_path(preview_dir: Path, file_id: int, src: Path) -> Path | None:
+    """Cache path of the browser-native preview for src, or None if the
+    browser can render src as-is (no preview needed)."""
+    ext = src.suffix.lower()
+    if ext in PREVIEW_IMAGE_EXTS:
+        return preview_dir / f"{file_id}-{int(src.stat().st_mtime)}.jpg"
+    if ext in PREVIEW_VIDEO_EXTS:
+        return preview_dir / f"{file_id}-{int(src.stat().st_mtime)}.mp4"
+    return None
+
+
+class PreviewManager:
+    """Builds each preview exactly once, no matter how many threads ask.
+
+    A per-key lock keeps a media request, a duplicate click, and the pre-warm
+    thread from launching concurrent ffmpeg runs for the same file;
+    `status_and_kick` gives the UI a non-blocking poll target so the first
+    view of a big video shows progress instead of a hung <video> element.
+    Failed keys are remembered so a corrupt file is not re-transcoded on
+    every poll (a server restart clears the memory and retries)."""
+
+    def __init__(self) -> None:
+        self._mu = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+        self._failed: set[str] = set()
+
+    def _lock(self, key: str) -> threading.Lock:
+        with self._mu:
+            return self._locks.setdefault(key, threading.Lock())
+
+    def ensure(self, src: Path, out: Path) -> Path | None:
+        """Return the preview for src, building it if missing. Blocks until
+        done; concurrent callers for the same key wait instead of duplicating
+        the work."""
+        if out.exists():
+            return out
+        with self._lock(out.name):
+            if out.exists():
+                return out
+            res = _make_preview(src, out)
+            with self._mu:
+                if res is None:
+                    self._failed.add(out.name)
+                else:
+                    self._failed.discard(out.name)
+            return res
+
+    def status_and_kick(self, src: Path, out: Path) -> str:
+        """Non-blocking: "ready", "pending", or "failed" — starting a
+        background build if none is running yet."""
+        if out.exists():
+            return "ready"
+        key = out.name
+        with self._mu:
+            if key in self._failed:
+                return "failed"
+            lock = self._locks.setdefault(key, threading.Lock())
+        if not lock.locked():
+            threading.Thread(
+                target=self.ensure, args=(src, out),
+                daemon=True, name=f"preview-{key}",
+            ).start()
+        return "pending"
+
+
+class PrewarmState:
+    """Thread-safe progress of the browse pre-warm thread, for the control
+    panel: how far along it is and whether a stop was requested."""
+
+    def __init__(self) -> None:
+        self._mu = threading.Lock()
+        self._d = {"active": False, "stopping": False,
+                   "total": 0, "done": 0, "built": 0, "current": ""}
+
+    def update(self, **kv) -> None:
+        with self._mu:
+            self._d.update(kv)
+
+    def snapshot(self) -> dict:
+        with self._mu:
+            return dict(self._d)
+
+
+def missing_previews(store: Store, preview_dir: Path) -> list[tuple[Path, Path]]:
+    """(source, cache path) for every live video whose browser-native preview
+    is not built yet. Newest first — the most likely to be browsed."""
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    todo = []
+    for r in store.db.execute(
+        "SELECT id, path FROM files WHERE deleted=0 AND kind='video' ORDER BY mtime DESC"
+    ):
+        src = Path(r["path"])
+        if not src.is_file():
+            continue
+        out = preview_path(preview_dir, r["id"], src)
+        if out is not None and not out.exists():
+            todo.append((src, out))
+    return todo
+
+
+def _prewarm_previews(
+    store: Store, preview_dir: Path, previews: PreviewManager,
+    stop: threading.Event, state: PrewarmState,
+) -> None:
+    """Build every missing video preview in the background so first views are
+    instant. Deep runs the same work as its last step (see cli.deep); this
+    thread mops up whatever is still missing when browse starts."""
+    todo = missing_previews(store, preview_dir)
+    if not todo:
+        return
+    log.info("pre-warming %d video preview(s) in the background", len(todo))
+    state.update(active=True, total=len(todo), done=0, built=0)
+    built = 0
+    try:
+        for i, (src, out) in enumerate(todo):
+            if stop.is_set():
+                log.info("preview pre-warm stopped after %d/%d", i, len(todo))
+                return
+            state.update(current=src.name)
+            if previews.ensure(src, out) is not None:
+                built += 1
+            state.update(done=i + 1, built=built)
+        log.info("preview pre-warm finished: %d/%d built", built, len(todo))
+    finally:
+        state.update(active=False, stopping=False, current="")
 
 
 # ---------- HTTP ----------
@@ -400,6 +564,9 @@ class Handler(BaseHTTPRequestHandler):
     store: Store
     thumb_dir: Path
     preview_dir: Path
+    previews: PreviewManager
+    prewarm_state: PrewarmState
+    prewarm_stop: threading.Event
     # When set, requests whose Host header is not listed get 403. This is the
     # standard DNS-rebinding defense for localhost servers: a malicious site
     # rebinding its hostname to 127.0.0.1 sends its own domain as Host and can
@@ -515,6 +682,13 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[:2] == ["api", "settings"]:
             changed = control.update_section(cfg, parts[2], body.get("values", {}))
             return self._json({"changed": changed})
+        if parts == ["api", "prewarm", "stop"]:
+            # Graceful: the in-flight transcode finishes (killing it would
+            # burn the work and mark the file failed), then the thread exits.
+            if self.prewarm_state.snapshot()["active"]:
+                self.prewarm_state.update(stopping=True)
+            self.prewarm_stop.set()
+            return self._json(self.prewarm_state.snapshot())
         if parts == ["api", "jobs"]:
             job = self.jobs.start(body.get("name", ""), body.get("args") or [])
             return self._json(job.summary(), status=201)
@@ -583,6 +757,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(404, "unknown file id")
             else:
                 self._json(detail)
+        elif parts == ["api", "prewarm"]:
+            self._json(self.prewarm_state.snapshot())
+        elif len(parts) == 3 and parts[:2] == ["api", "preview"] and parts[2].isdigit():
+            self._serve_preview_status(int(parts[2]))
         elif len(parts) == 2 and parts[0] == "thumb" and parts[1].isdigit():
             self._serve_thumb(int(parts[1]))
         elif len(parts) == 2 and parts[0] == "media" and parts[1].isdigit():
@@ -610,6 +788,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_preview_status(self, file_id: int) -> None:
+        """Poll target for the UI: is this file's preview ready? Kicks off a
+        background transcode on first ask, so the media request that follows
+        a "ready" answer is served straight from the cache."""
+        info = self.store.file_path(file_id)
+        if info is None:
+            return self._error(404, "unknown file id")
+        src, _kind = info
+        if not src.is_file():
+            return self._error(404, "file missing on disk")
+        out = preview_path(self.preview_dir, file_id, src)
+        if out is None:  # browser-native, media/ serves the original
+            return self._json({"status": "ready"})
+        self._json({"status": self.previews.status_and_kick(src, out)})
+
     def _serve_media(self, file_id: int) -> None:
         info = self.store.file_path(file_id)
         if info is None:
@@ -617,15 +810,13 @@ class Handler(BaseHTTPRequestHandler):
         src, _kind = info
         if not src.is_file():
             return self._error(404, "file missing on disk")
-        ext = src.suffix.lower()
         ctype = mimetypes.guess_type(src.name)[0] or "application/octet-stream"
-        if ext in PREVIEW_IMAGE_EXTS or ext in PREVIEW_VIDEO_EXTS:
-            preview_ext = ".jpg" if ext in PREVIEW_IMAGE_EXTS else ".mp4"
-            out = self.preview_dir / f"{file_id}-{int(src.stat().st_mtime)}{preview_ext}"
-            if not out.exists() and _make_preview(src, out) is None:
+        out = preview_path(self.preview_dir, file_id, src)
+        if out is not None:
+            if self.previews.ensure(src, out) is None:
                 return self._error(404, "preview unavailable for this file")
             src = out
-            ctype = "image/jpeg" if preview_ext == ".jpg" else "video/mp4"
+            ctype = "image/jpeg" if out.suffix == ".jpg" else "video/mp4"
         size = src.stat().st_size
         start, end = 0, size - 1
         status = 200
@@ -666,7 +857,22 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
 
-def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+class _QuietServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that doesn't spray tracebacks when a client hangs
+    up mid-connection — browsers reset kept-alive sockets constantly (tab
+    refresh, aborted <video> loads), and stock socketserver prints each one."""
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            log.debug("client %s dropped the connection", client_address)
+            return
+        super().handle_error(request, client_address)
+
+
+def make_server(
+    cfg: Config, host: str = "127.0.0.1", port: int = 8765, prewarm: bool = False
+) -> ThreadingHTTPServer:
     import secrets
 
     from .jobs import JobRunner
@@ -686,15 +892,26 @@ def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765) -> Threa
             "store": Store(cfg.db_path),
             "thumb_dir": thumb_dir,
             "preview_dir": preview_dir,
+            "previews": PreviewManager(),
+            "prewarm_state": PrewarmState(),
+            "prewarm_stop": threading.Event(),
             "config": cfg,
             "jobs": JobRunner(),
             "csrf_token": secrets.token_urlsafe(32),
             "writable": writable,
         },
     )
-    server = ThreadingHTTPServer((host, port), handler)
+    server = _QuietServer((host, port), handler)
     server.daemon_threads = True
     server.job_runner = handler.jobs  # so serve() can stop jobs on shutdown
+    server.prewarm_stop = handler.prewarm_stop  # so serve() can halt the pre-warmer
+    if prewarm:
+        threading.Thread(
+            target=_prewarm_previews,
+            args=(handler.store, preview_dir, handler.previews,
+                  handler.prewarm_stop, handler.prewarm_state),
+            daemon=True, name="preview-prewarm",
+        ).start()
     if is_loopback(host):
         actual_port = server.server_address[1]  # resolved when port=0
         allowed = set()
@@ -707,9 +924,10 @@ def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765) -> Threa
 
 
 def serve(
-    cfg: Config, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True
+    cfg: Config, host: str = "127.0.0.1", port: int = 8765,
+    open_browser: bool = True, prewarm: bool = True,
 ) -> None:
-    server = make_server(cfg, host, port)
+    server = make_server(cfg, host, port, prewarm=prewarm)
     url = f"http://{host}:{port}/"
     log.info("browse UI listening on %s", url)
     if open_browser:
@@ -722,4 +940,6 @@ def serve(
         runner = getattr(server, "job_runner", None)
         if runner is not None:
             runner.shutdown()  # don't orphan a scan/deep when the UI stops
+        server.prewarm_stop.set()
+        kill_active_transcodes()  # free the CPU the moment browse exits
         server.server_close()
