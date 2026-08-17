@@ -49,8 +49,8 @@ file-index deep              # tier 2: VLM images, scanned PDFs, Whisper, video 
 file-index ask "where are my insurance documents?"
 file-index organize ~/Downloads            # prints a plan, changes nothing
 file-index organize ~/Downloads --apply    # applies moves/renames after confirmation
-file-index browse            # local web gallery: files + captions, search, filters
-file-index exclude PATH      # remove files from the index + future scans (disk untouched)
+file-index browse            # local web UI: gallery + captions, search, control panel
+file-index exclude PATTERN   # dir, file, or glob: out of index + future scans (disk untouched)
 file-index reindex           # re-extract stages whose extractor or model changed
 file-index purge             # erase indexed data of removed/excluded files for good
 file-index status            # queue stats, per-type counts, failures
@@ -60,7 +60,10 @@ file-index watch             # incremental watcher (or install the systemd unit)
 `deep` is safe to interrupt (ctrl-c or `kill`): it finishes the current file,
 checkpoints, and unloads all Ollama models so the GPU is immediately free for
 other work (send the signal twice to skip the current file). It resumes
-exactly where it left off. Re-running `scan` with no changes is
+exactly where it left off. Once the queue drains, `deep` ends by pre-building
+browser video previews (the same cache `browse` warms in the background — see
+[Configuration](#configuration)), CPU-only work that is likewise ctrl-c safe
+and resumable. Re-running `scan` with no changes is
 near-instant (size+mtime short-circuit, content-hash verification on change).
 
 `deep` overlaps CPU and GPU work: while the GPU runs the current file's models,
@@ -144,14 +147,31 @@ first), Whisper device/precision. After changing a model name, run
 it.
 
 Data lives in `~/.local/share/file-index/` (`index.db`, logs, audit log,
-`thumbs/` cache for the browse UI).
+`thumbs/` and `previews/` caches for the browse UI). To remove every trace of
+the index itself, delete that directory and `~/.config/file-index/` — indexed
+files on disk are never touched.
 
 `browse` serves a gallery at `http://127.0.0.1:8765/` (localhost only unless
 `--host` says otherwise): thumbnails for images/videos/PDFs, the VLM caption or
 video/audio summary on each card, full-text search over everything indexed,
 kind filters, and a detail view with the original media, OCR text, EXIF,
 transcripts, and scene lists. It opens the DB read-only, so it is safe to keep
-running while `scan`/`deep` work.
+running while `scan`/`deep` work. Flags: `--host`/`--port` change the bind
+(default `127.0.0.1:8765`), `--no-open` skips launching the browser, and
+`--no-prewarm` skips the preview pre-warmer.
+
+Formats browsers can't render natively (HEIC photos, HEVC `.mov` video) are
+transcoded to JPEG / H.264 MP4 server-side and cached in `previews/`; the
+detail view shows a "preparing video preview" state while a first-time
+transcode runs. A background pre-warmer builds missing video previews at
+startup (newest first, resumable, `--no-prewarm` to opt out) and can be
+stopped from the settings tab; `deep` builds the same cache as its last step.
+
+The UI is also a control panel: the settings tab edits roots, excludes,
+models, deep tuning, and limits in `config.yaml`, and the jobs tab launches
+and stops `scan`, `deep`, `reindex`, and `purge` (one at a time — they share
+the index and GPU). Writes are enabled only on loopback binds and are gated on
+a per-start CSRF token.
 
 On a loopback bind the server accepts only loopback `Host` headers and answers
 403 otherwise, so a website you visit cannot DNS-rebind to `127.0.0.1:8765` and
@@ -167,8 +187,9 @@ anyone who can reach the address — `browse` prints a warning when you do it.
   Deletion is not implemented anywhere (proposals may only *flag* candidates).
 - Removal from the index is soft by default (`exclude` and vanished files keep
   their extractions, so re-adding is free). `purge` makes it permanent —
-  erasing bodies, captions, transcripts, embeddings and cached thumbnails of
-  removed files — for when the point of excluding was privacy, not tidiness.
+  erasing bodies, captions, transcripts, embeddings and cached
+  thumbnails/previews of removed files — for when the point of excluding was
+  privacy, not tidiness.
   Use `--older-than-days N` to keep a grace period. Files on disk are never
   touched by either.
 - Every applied write is recorded in the audit log (DB + `audit.log`) with
@@ -212,7 +233,7 @@ agent CLI ← search/organize tools ← index
 .venv/bin/pytest
 ```
 
-139 tests, no GPU or network required — models and Whisper are mocked, and the
+178 tests, no GPU or network required — models and Whisper are mocked, and the
 handful of tests that need real ffmpeg generate their own clips and skip when it
 is absent.
 
@@ -228,4 +249,6 @@ is absent.
   traversal and symlinks leaving a root), `organize` plan filtering and
   `--apply` guards, audit-log integrity, and `purge`.
 - **Interfaces**: the browse Store/HTTP endpoints (search, ranges, thumbnails,
-  Host validation), `reindex` version comparison and routing, and the watcher.
+  HEIC/MOV previews, pre-warm status/stop, Host validation), the control panel
+  (settings writes, the job runner, CSRF gating), `reindex` version comparison
+  and routing, and the watcher.
